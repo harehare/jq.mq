@@ -1,6 +1,8 @@
 # jq.mq
 
-> **Note:** This project is currently under active development.
+> [!WARNING]
+> This project is currently under active development.
+
 
 An implementation of jq JSON processor written in the [mq](https://github.com/harehare/mq).
 
