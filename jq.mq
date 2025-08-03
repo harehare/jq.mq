@@ -1,0 +1,863 @@
+# jq Implementation in mq
+# Based on jq manual: https://jqlang.org/manual/
+
+# ==============================================================================
+# JSON Parsing Functions
+# ==============================================================================
+
+def split_string(input, pos):
+  let str_content = slice(input, 1, pos)
+  | let remaining = slice(input, pos + 1, len(input))
+  | [str_content, remaining]
+end
+
+def split_number(input, number_str):
+  let remaining = slice(input, len(number_str), len(input))
+  | [to_number(number_str), remaining]
+end
+
+def parse_json_value(input):
+  let input = trim(input)
+  | def handle_string_char(char, escaped, pos):
+      if (char == "\"" && !escaped):
+        [true, pos]
+      elif (char == "\""):
+        [false, not(escaped)]
+      else:
+        [false, false]
+    end
+
+  | def parse_string(input):
+      let escaped = false
+      | let pos = 1
+      | let end_pos = None
+      | let pos2 = until (is_none(end_pos) && pos < len(input)):
+            let char = slice(input, pos, pos + 1)
+            | let tokens = handle_string_char(char, escaped, pos)
+            | let should_end = tokens[0]
+            | let new_escaped = tokens[1]
+            | let end_pos = if (should_end): pos else: None
+            | let escaped = if (not(should_end)): new_escaped else: false
+            | let pos = pos + 1
+            | pos
+          end
+      | split_string(input, pos2 - 1)
+    end
+
+  | def parse_number(input):
+      let input = trim(input)
+      | let number_pattern = "^(-?[0-9]+(?:\\.[0-9]+)?)"
+      | let match_result = match(input, number_pattern)
+      | if (is_empty(match_result)):
+          [None, input]
+        else:
+          split_number(input, first(match_result))
+    end
+
+  | def parse_boolean(input):
+      let input = trim(input)
+      | if (starts_with(input, "true")):
+          [true, slice(input, 4, len(input))]
+        elif (starts_with(input, "false")):
+          [false, slice(input, 5, len(input))]
+        else:
+          [None, input]
+    end
+
+  | def parse_null(input):
+      let input = trim(input)
+      | if (starts_with(input, "null")):
+          [None, slice(input, 4, len(input))]
+        else:
+          [None, input]
+    end
+
+  | def _parse_array(input):
+      let input = slice(input, 1, len(input))
+      | let input = trim(input)
+      | let elements = []
+      | let finish = false
+      | if (starts_with(input, "]")):
+          [elements, slice(input, 1, len(input))]
+        else:
+          until (!finish):
+            let tokens = parse_json_value(input)
+            | let value = tokens[0]
+            | let rest = tokens[1]
+            | let elements = elements + [value]
+            | let input = trim(rest)
+            | let _ = if (is_none(value)): error("Invalid JSON array element")
+            | let finish = starts_with(input, "]")
+            | let input = if (starts_with(input, ",")):
+                  trim(slice(input, 1, len(input)))
+                elif (starts_with(input, "]")):
+                  trim(slice(input, 1, len(input)))
+                else:
+                  error("Expected ',' or ']' in array")
+            | [elements, input];
+    end
+
+  | def parse_array(input):
+      let input = trim(input)
+      | if (not(starts_with(input, "["))):
+          [None, input]
+        else:
+          _parse_array(input)
+    end
+
+  | def _parse_object_value(obj, key, input):
+      let input = trim(slice(input, 1, len(input)))
+      | let tokens = parse_json_value(input)
+      | let value = tokens[0]
+      | let rest = tokens[1]
+      | let _ = if (is_none(value)): error("Invalid JSON object value")
+      | let obj = set(obj, key, value)
+      | let input = trim(rest)
+      | if (starts_with(input, ",")):
+          [obj, trim(slice(input, 1, len(input)))]
+        elif (starts_with(input, "}")):
+          [obj, input]
+        elif (is_empty(input)):
+          [obj, trim(input)]
+        else:
+          error("Expected ',' or '}' in object")
+    end
+
+  | def _parse_object(input):
+      let input = slice(input, 1, len(input))
+      | let input = trim(input)
+      | let obj = {}
+      | let result = if (starts_with(input, "}")):
+            [obj, slice(input, 1, len(input))]
+          else:
+            until (!starts_with(input, "}") && !is_empty(input)):
+              let tokens = parse_string(input)
+              | let key = tokens[0]
+              | let input = trim(tokens[1])
+              | let _ = if (is_none(key)): error("Invalid JSON object key")
+              | let _ = if (!starts_with(input, ":")): error("Expected ':' after object key")
+              | let result = _parse_object_value(obj, key, input)
+              | let obj = result[0]
+              | let input = trim(result[1])
+              | let result = if (starts_with(input, ",")):
+                    [obj, slice(input, 1, len(input))]
+                  else:
+                    [obj, input]
+              | let obj = result[0]
+              | let input = trim(result[1])
+              | [obj, input]
+            end
+      | let obj = result[0]
+      | let input = result[1]
+      | if (starts_with(input, "}")):
+          [obj, trim(slice(input, 1, len(input)))]
+        else:
+          [obj, input]
+
+    end
+
+  | def parse_object(input):
+      let input = trim(input)
+      | if (!starts_with(input, "{")):
+          [None, input]
+        else:
+          _parse_object(input)
+    end
+
+  | if (starts_with(input, "{")):
+      parse_object(input)
+    elif (starts_with(input, "[")):
+      parse_array(input)
+    elif (starts_with(input, "\"")):
+      parse_string(input)
+    elif (starts_with(input, "t") || starts_with(input, "f")):
+      parse_boolean(input)
+    elif (starts_with(input, "n")):
+      parse_null(input)
+    else:
+      parse_number(input)
+end
+
+# ==============================================================================
+# jq Query Tokenizer and Parser
+# ==============================================================================
+
+def handle_dot_array_token(tokens, pos):
+  [tokens + [".[]"], pos + 3]
+end
+
+def handle_double_dot_token(remaining, tokens, pos):
+  let key_match = match(remaining, "^..([a-zA-Z_][a-zA-Z0-9_]*)")
+  | if (!is_empty(key_match)):
+      [tokens + [first(key_match)], pos + len(first(key_match))]
+    else:
+      [tokens + [".."], pos + 2]
+end
+
+def handle_single_dot_token(remaining, tokens, pos):
+  let key_array_match = match(remaining, "^.([a-zA-Z_][a-zA-Z0-9_]*)\\[\\]")
+  | let key_match = match(remaining, "^.([a-zA-Z_][a-zA-Z0-9_]*)")
+  | if (!is_empty(key_array_match)):
+      [tokens + [first(key_array_match)], pos + len(first(key_array_match)) + 2]
+    elif (!is_empty(key_match)):
+      [tokens + [first(key_match)], pos + len(first(key_match))]
+    else:
+      [tokens + ["."], pos + 1]
+end
+
+def handle_bracket_token(remaining, tokens, pos):
+  let bracket_match = match(remaining, "^[([^]]+)]")
+  | if (!is_empty(bracket_match)):
+      [tokens + [first(bracket_match)], pos + len(first(bracket_match))]
+    else:
+      error("Invalid bracket expression")
+end
+
+def handle_pipe_token(tokens, pos):
+  [tokens + ["|"], pos + 1]
+end
+
+def handle_function_with_args_token(remaining, tokens, pos):
+  let func_match = match(remaining, "^(error|sort_by|group_by|unique_by|max_by|min_by|has|in|contains|inside|startswith|endswith|ltrimstr|rtrimstr|split|join|range|recurse|walk|select|map|if|then|else|elif|end|and|or|not|try|catch|reduce|foreach|until|while|repeat|limit|first|last|nth|index|rindex|indices|debug)\\([a-zA-Z0-9_,\"\\s]*\\)")
+  | if (!is_empty(func_match)):
+      [tokens + [first(func_match)], pos + len(first(func_match))]
+    else:
+      [tokens + [remaining], pos + len(remaining)]
+end
+
+def handle_function_token(remaining, tokens, pos):
+  let func_match = match(remaining, "^(length|keys|keys_unsorted|values|type|empty|add|tonumber|tostring|sort|unique|max|min|ascii_downcase|ascii_upcase|reverse|flatten|paths|any|all|input|inputs)")
+  | if (!is_empty(func_match)):
+      [tokens + [first(func_match)], pos + len(first(func_match))]
+    else:
+      handle_function_with_args_token(remaining, tokens, pos)
+end
+
+def handle_single_char_token(remaining, tokens, pos):
+  let char_match = match(remaining, "^(.)")
+  | if (!is_empty(char_match)):
+      [tokens + [first(char_match)], pos + 1]
+    else:
+      [tokens, pos + 1]
+end
+
+def tokenize_jq(query):
+  let tokens = []
+  | let pos = 0
+  | until (pos < len(query)):
+      let remaining = slice(query, pos, len(query))
+      | let _tokens = if (starts_with(remaining, ".[]")):
+            handle_dot_array_token(tokens, pos)
+          elif (starts_with(remaining, "..")):
+            handle_double_dot_token(remaining, tokens, pos)
+          elif (starts_with(remaining, ".")):
+            handle_single_dot_token(remaining, tokens, pos)
+          elif (starts_with(remaining, "[")):
+            handle_bracket_token(remaining, tokens, pos)
+          elif (starts_with(remaining, "|")):
+            handle_pipe_token(tokens, pos)
+          elif (starts_with(remaining, " ") || starts_with(remaining, "\t")):
+            [tokens, pos + 1]
+          else:
+            handle_function_token(remaining, tokens, pos)
+
+      | let tokens = _tokens[0]
+      | let pos = _tokens[1]
+      | tokens
+    end
+end
+
+# ==============================================================================
+# Core jq Functions
+# ==============================================================================
+
+def jq_identity(data): data;
+
+def jq_keys(data):
+  if (is_dict(data)):
+    sort(keys(data))
+  elif (is_array(data)):
+    range(0, len(data))
+  else:
+    error("keys() only works on objects and arrays")
+end
+
+def jq_keys_unsorted(data):
+  if (is_dict(data)):
+    keys(data)
+  elif (is_array(data)):
+    range(0, len(data))
+  else:
+    error("keys_unsorted() only works on objects and arrays")
+end
+
+def jq_values(data):
+  if (is_dict(data)):
+    values(data)
+  elif (is_array(data)):
+    data
+  else:
+    error("values() only works on objects and arrays")
+end
+
+def jq_length(data):
+  if (is_dict(data) || is_array(data) || is_string(data)):
+    len(data)
+  elif (is_none(data)):
+    0
+  else:
+    error("length() not supported for this type")
+end
+
+def jq_type(data):
+  let t = type(data)
+  | if (t == "dict"): "object"
+    elif (is_none(data)): "null"
+    else: t
+end
+
+def jq_empty(data): None;
+
+def jq_reverse(data):
+  if (is_array(data)):
+    reverse(data)
+  else:
+    error("reverse() only works on arrays")
+end
+
+def jq_sort(data):
+  if (is_array(data)):
+    sort(data)
+  else:
+    error("sort() only works on arrays")
+end
+
+def jq_unique(data):
+  if (is_array(data)):
+    uniq(data)
+  else:
+    error("unique() only works on arrays")
+end
+
+def jq_flatten(data, depth):
+  if (is_array(data)):
+    flatten(data)
+  else:
+    error("flatten() only works on arrays")
+end
+
+def jq_add(data):
+  if (is_array(data)):
+    fold(data, [], fn(acc, item): acc + item;)
+  else:
+    data
+end
+
+def jq_tonumber(data):
+  if (is_string(data)):
+    to_number(data)
+  elif (is_number(data)):
+    data
+  else:
+    error("Cannot convert to number")
+end
+
+def jq_tostring(data):
+  if (is_string(data)):
+    data
+  elif (is_number(data) || is_bool(data)):
+    to_string(data)
+  elif (is_none(data)):
+    "null"
+  else:
+    to_string(data)
+end
+
+def jq_has(data, args):
+  let key = if (len(args) == 1): first(args) else: error("has() requires exactly one argument")
+  | if (is_dict(data)):
+      !is_none(get(data, key))
+    elif (is_array(data)):
+      to_number(key) >= 0 && to_number(key) < len(data)
+    else:
+      false
+end
+
+def jq_contains(data, args):
+  let needle = if (len(args) == 1): first(args) else: error("contains() requires exactly one argument")
+  | if (is_string(data) && is_string(needle)):
+      contains(data, needle)
+    elif (is_array(data)):
+      any(data, fn(item): item == needle;)
+    elif (is_dict(data) && is_dict(needle)):
+      all(entries(needle), fn(entry):
+        let key = first(entry)
+        | let value = last(entry)
+        | jq_has(data, [key]) && get(data, key) == value;)
+    else:
+      false
+end
+
+def jq_startswith(data, args):
+  let prefix = if (len(args) == 1): first(args) else: error("startswith() requires exactly one argument")
+  | if (is_string(data) && is_string(prefix)):
+      starts_with(data, prefix)
+    else:
+      false
+end
+
+def jq_endswith(data, args):
+  let suffix = if (len(args) == 1): first(args) else: error("endswith() requires exactly one argument")
+  | if (is_string(data) && is_string(suffix)):
+      ends_with(data, suffix)
+    else:
+      false
+end
+
+def jq_split(data, args):
+  let separator = if (len(args) == 1): first(args) else: error("split() requires exactly one argument")
+  | if (is_string(data) && is_string(separator)):
+      split(data, separator)
+    else:
+      error("split() requires string inputs")
+end
+
+def jq_join(data, args):
+  let separator = if (len(args) == 1): first(args) else: error("join() requires exactly one argument")
+  | if (is_array(data) && is_string(separator)):
+      join(data, separator)
+    else:
+      error("join() requires array and string")
+end
+
+def jq_map(data, expr):
+  if (is_array(data)):
+    map(data, expr)
+  else:
+    error("map() only works on arrays")
+end
+
+def jq_select(data, condition): if (condition): data else: "";
+
+def jq_recurse_down(data):
+  if (is_dict(data)):
+    [data] + flatten(map(values(data), jq_recurse_down))
+  elif (is_array(data)):
+    [data] + flatten(map(data, jq_recurse_down))
+  else:
+    [data]
+end
+
+def jq_paths(data): jq_paths_helper(data, []);
+
+def jq_paths_helper(data, current_path):
+  if (is_dict(data)):
+    flatten(map(entries(data), fn(entry):
+          let key = first(entry)
+          | let value = last(entry)
+          | [current_path + [key]] + jq_paths_helper(value, current_path + [key]);))
+  elif (is_array(data)):
+    flatten(map(range(0, len(data)), fn(i):
+          [current_path + [i]] + jq_paths_helper(get(data, i), current_path + [i]);))
+  else: []
+end
+
+def jq_all(data):
+  if (is_array(data)):
+    all(data, fn(item): item;)
+  else:
+    error("all() only works on arrays")
+end
+
+def jq_any(data):
+  if (is_array(data)):
+    any(data, fn(item): item;)
+  else:
+    error("any() only works on arrays")
+end
+
+def jq_ascii_downcase(data):
+  if (is_string(data)):
+    downcase(data)
+  else:
+    error("ascii_downcase() only works on strings")
+end
+
+def jq_ascii_upcase(data):
+  if (is_string(data)):
+    upcase(data)
+  else:
+    error("ascii_upcase() only works on strings")
+end
+
+def jq_array_property(data, key):
+  if (is_dict(data) && jq_has(data, [key]) && is_array(get(data, key))):
+    get(data, key)
+  else:
+    error("jq: ." + key + "[] expects an object with an array property '" + key + "'")
+end
+
+def jq_min(data):
+  if (is_array(data)):
+    min(data)
+  else:
+    error("min() only works on arrays")
+end
+
+def jq_max(data):
+  if (is_array(data)):
+    max(data)
+  else:
+    error("max() only works on arrays")
+end
+
+# ==============================================================================
+# jq Query Execution Engine
+# ==============================================================================
+
+def handle_quote_char(args, current_arg, in_string, in_object, in_array, escaped, pos):
+  [args, current_arg + "\"", !in_string, in_object, in_array, false, pos]
+end
+
+def handle_escape_char(args, current_arg, in_string, in_object, in_array, escaped, pos):
+  [args, current_arg + "\\", in_string, in_object, in_array, not(escaped), pos]
+end
+
+def handle_open_brace(args, current_arg, in_string, in_object, in_array, escaped, pos):
+  [args, current_arg + "{", in_string, in_object + 1, in_array, false, pos]
+end
+
+def handle_close_brace(args, current_arg, in_string, in_object, in_array, escaped, pos):
+  [args, current_arg + "}", in_string, in_object - 1, in_array, false, pos]
+end
+
+def handle_open_bracket(args, current_arg, in_string, in_object, in_array, escaped, pos):
+  [args, current_arg + "[", in_string, in_object, in_array + 1, false, pos]
+end
+
+def handle_close_bracket(args, current_arg, in_string, in_object, in_array, escaped, pos):
+  [args, current_arg + "]", in_string, in_object, in_array - 1, false, pos]
+end
+
+def handle_comma_char(args, current_arg, in_string, in_object, in_array, escaped, pos):
+  [args + [trim(current_arg)], "", in_string, in_object, in_array, false, pos]
+end
+
+def handle_regular_char(args, current_arg, in_string, in_object, in_array, escaped, pos, char):
+  [args, current_arg + char, in_string, in_object, in_array, false, pos]
+end
+
+def handle_dict_recursive_descent(data, key, results):
+  if (jq_has(data, key)):
+    results + [get(data, key)] + flatten(map(values(data), fn(v): jq_recursive_descent(v, key);))
+  else:
+    results + flatten(map(values(data), fn(v): jq_recursive_descent(v, key);))
+end
+
+def handle_array_recursive_descent(data, key, results):
+  results + flatten(map(data, fn(item): jq_recursive_descent(item, key);))
+end
+
+def jq_recursive_descent(data, key):
+  let results = []
+  | if (is_dict(data)):
+      handle_dict_recursive_descent(data, key, results)
+    elif (is_array(data)):
+      handle_array_recursive_descent(data, key, results)
+    else:
+      results
+end
+
+def is_function_call(arg):
+  let trimmed = trim(arg)
+  | match(trimmed, "^[a-zA-Z_][a-zA-Z0-9_]*\\(.*\\)$")
+end
+
+def execute_jq_filter(data, filter):
+  def execute_index_filter(data, index):
+    if (is_array(data)):
+      if (index < 0):
+        get(data, len(data) + index)
+      else:
+        get(data, index)
+    else:
+      error("Cannot index " + jq_type(data) + " with number")
+  end
+
+  | def execute_bracket_filter(data, filter):
+      def execute_slice_filter(data, index_expr):
+        let parts = split(index_expr, ":")
+        | let start = if (is_empty(first(parts))): 0 else: to_number(first(parts))
+        | let _end = if (is_empty(last(parts))): len(data) else: to_number(last(parts))
+        | slice(data, start, _end)
+      end
+
+      | let index_expr = slice(filter, 1, len(filter) - 1)
+      | if (contains(index_expr, ":")):
+          execute_slice_filter(data, index_expr)
+        else:
+          execute_index_filter(data, to_number(index_expr))
+    end
+
+  | def execute_iterator_filter(data):
+      if (is_array(data)):
+        data
+      elif (is_dict(data)):
+        values(data)
+      else:
+        error("Cannot iterate over " + jq_type(data))
+    end
+
+  | def execute_property_filter(data, filter):
+      if (is_dict(data)):
+        get(data, slice(filter, 1, len(filter)))
+      else:
+        error("Cannot index " + jq_type(data) + " with string \"" + slice(filter, 1, len(filter)) + "\"")
+    end
+
+  | def execute_recursive_filter(data, filter):
+      let key = slice(filter, 2, len(filter))
+      | jq_recursive_descent(data, key)
+    end
+
+  | let builtin_result = execute_builtin_filter(data, filter)
+  | if (!is_none(builtin_result)):
+      builtin_result
+    elif (filter == ".[]"):
+      execute_iterator_filter(data)
+    elif (starts_with(filter, ".")):
+      execute_property_filter(data, filter)
+    elif (starts_with(filter, "[") && ends_with(filter, "]")):
+      execute_bracket_filter(data, filter)
+    elif (starts_with(filter, "..")):
+      execute_recursive_filter(data, filter)
+    else:
+      error("Unknown filter: " + filter)
+end
+
+def evaluate_function_call(arg, data):
+
+  def evaluate_if_function(args_str, data):
+    let parts = split(args_str, ",")
+    | let _ = if (len(parts) != 3): error("if() requires exactly 3 arguments: condition, then_value, else_value")
+    | let condition = trim(parts[0])
+    | let then_value = trim(parts[1])
+    | let else_value = trim(parts[2])
+    | let parsed = parse_json_value(condition)
+    | let parsed = parse_json_value(else_value)
+    | let cond_result = if (is_function_call(condition)):
+          evaluate_function_call(condition, data)
+        elif (!is_none(parsed[0])): parsed[0] else: condition
+    | let then_result = if (is_function_call(then_value)): evaluate_function_call(then_value, data)
+    | if (!is_none(parsed[0])): parsed[0] else: then_value
+    | let else_result = if (is_function_call(else_value)): evaluate_function_call(else_value, data)
+    | if (!is_none(parsed[0])): parsed[0] else: else_value
+    | if (cond_result): then_result else: else_result
+  end
+
+  | let trimmed = trim(arg)
+  | let func_match = match(trimmed, "^([a-zA-Z_][a-zA-Z0-9_]*)\\((.*)\\)$")
+  | let func_name = func_match[0]
+  | let func_args = func_match[1]
+  | if (!is_empty(func_match)):
+      if (func_name == "if"):
+        evaluate_if_function(func_args, data)
+      else:
+        execute_jq_filter(data, trimmed)
+    else:
+      trimmed
+end
+
+def parse_filter_args(args_str, data):
+  let args_content = slice(args_str, 1, len(args_str) - 1)
+  | let args = []
+  | let pos = 0
+  | let current_arg = ""
+  | let in_string = false
+  | let in_object = 0
+  | let in_array = 0
+  | let escaped = false
+
+  | let result = until (pos < len(args_content)):
+        let char = slice(args_content, pos, pos + 1)
+        | let pos = pos + 1
+        | let result = if (char == "\"" && !escaped):
+              handle_quote_char(args, current_arg, in_string, in_object, in_array, escaped, pos)
+            elif (char == "\\" && in_string):
+              handle_escape_char(args, current_arg, in_string, in_object, in_array, escaped, pos)
+            elif (char == "{" && !in_string):
+              handle_open_brace(args, current_arg, in_string, in_object, in_array, escaped, pos)
+            elif (char == "}" && !in_string):
+              handle_close_brace(args, current_arg, in_string, in_object, in_array, escaped, pos)
+            elif (char == "[" && !in_string):
+              handle_open_bracket(args, current_arg, in_string, in_object, in_array, escaped, pos)
+            elif (char == "]" && !in_string):
+              handle_close_bracket(args, current_arg, in_string, in_object, in_array, escaped, pos)
+            elif (char == "," && !in_string && in_object == 0 && in_array == 0):
+              handle_comma_char(args, current_arg, in_string, in_object, in_array, escaped, pos)
+            else:
+              handle_regular_char(args, current_arg, in_string, in_object, in_array, escaped, pos, char)
+        | let args = result[0]
+        | let current_arg = result[1]
+        | let in_string = result[2]
+        | let in_object = result[3]
+        | let in_array = result[4]
+        | let escaped = result[5]
+        | let pos = result[6]
+        | result
+      end
+
+  | let args = result[0]
+  | let current_arg = result[1]
+  | let args = if (!is_empty(trim(current_arg))): args + [trim(current_arg)] else: args
+  | let processed_args = map(args, fn(arg):
+          let trimmed_arg = trim(arg)
+          | let is_call = is_function_call(trimmed_arg)
+          | let parsed_result = if (is_function_call(trimmed_arg)):
+                evaluate_function_call(trimmed_arg, data)
+              else:
+                parse_json_value(trimmed_arg)
+          | let parsed_value = if (is_call): None else: parsed_result[0]
+          | if (is_none(parsed_value)): trimmed_arg else: parsed_value;)
+
+  | if (len(processed_args) == 1 && is_empty(to_string(first(processed_args)))): [] else: processed_args
+end
+
+def execute_builtin_filter(data, filter):
+  if (starts_with(filter, ".") && ends_with(filter, "[]")):
+    jq_array_property(data, slice(filter, 1, len(filter) - 2))
+  elif (filter == "."):
+    data
+  elif (filter == "keys"):
+    jq_keys(data)
+  elif (filter == "keys_unsorted"):
+    jq_keys_unsorted(data)
+  elif (filter == "values"):
+    jq_values(data)
+  elif (filter == "length"):
+    jq_length(data)
+  elif (filter == "type"):
+    jq_type(data)
+  elif (filter == "empty"):
+    jq_empty(data)
+  elif (filter == "reverse"):
+    jq_reverse(data)
+  elif (filter == "sort"):
+    jq_sort(data)
+  elif (filter == "unique"):
+    jq_unique(data)
+  elif (filter == "flatten"):
+    jq_flatten(data, None)
+  elif (filter == "add"):
+    jq_add(data)
+  elif (filter == "tonumber"):
+    jq_tonumber(data)
+  elif (filter == "tostring"):
+    jq_tostring(data)
+  elif (filter == "paths"):
+    jq_paths(data)
+  elif (filter == "all"):
+    jq_all(data)
+  elif (filter == "any"):
+    jq_any(data)
+  elif (filter == "ascii_downcase"):
+    jq_ascii_downcase(data)
+  elif (filter == "ascii_upcase"):
+    jq_ascii_upcase(data)
+  elif (filter == "min"):
+    jq_min(data)
+  elif (filter == "max"):
+    jq_max(data)
+  elif (starts_with(filter, "has")):
+    jq_has(data, parse_filter_args(slice(filter, 3, len(filter) - 1), data))
+  elif (starts_with(filter, "contains")):
+    jq_contains(data, parse_filter_args(slice(filter, 8, len(filter)), data))
+  elif (starts_with(filter, "startswith")):
+    jq_startswith(data, parse_filter_args(slice(filter, 10, len(filter)), data))
+  elif (starts_with(filter, "endswith")):
+    jq_endswith(data, parse_filter_args(slice(filter, 8, len(filter)), data))
+  elif (starts_with(filter, "split")):
+    jq_split(data, parse_filter_args(slice(filter, 5, len(filter)), data))
+  elif (starts_with(filter, "join")):
+    jq_join(data, parse_filter_args(slice(filter, 4, len(filter)), data))
+  elif (starts_with(filter, "map")):
+    jq_map(data, parse_filter_args(slice(filter, 3, len(filter)), data))
+  elif (starts_with(filter, "select")):
+    jq_select(data, parse_filter_args(slice(filter, 6, len(filter)), data))
+  elif (starts_with(filter, "recurse_down")):
+    jq_recurse_down(data)
+  else:
+    None
+end
+
+def execute_jq_pipeline(data, filters):
+  fold(filters, data, fn(current_data, filter):
+    if (is_none(current_data)):
+      None
+    elif (is_array(current_data) && filter != "length" && filter != "type"):
+      map(current_data, fn(item): execute_jq_filter(item, filter);)
+    else:
+      execute_jq_filter(current_data, filter);)
+end
+
+def parse_jq_query(query):
+  let tokens = tokenize_jq(query)
+  | let filters = []
+  | let i = 0
+  | let filters = until (i < len(tokens)):
+        let token = tokens[i]
+        | let i = i + 1
+        | let filters = if (token != "|"):
+              filters + [token]
+            else:
+              filters
+        | filters
+      end
+  | filters
+end
+
+# ==============================================================================
+# Main jq Function
+# ==============================================================================
+
+def jq(json_input, query):
+  let data = parse_json_value(replace(json_input, "\n", ""))
+  | let data = data[0]
+  | let filters = parse_jq_query(query)
+  | execute_jq_pipeline(data, filters)
+end
+
+# ==============================================================================
+# Helper function to format output as JSON
+# ==============================================================================
+
+def format_json_string(data):
+  "\"" + data + "\""
+end
+
+def format_json_array(data):
+  "[" + join(map(data, format_json_output), ", ") + "]"
+end
+
+def format_json_object(data):
+  "{" + join(
+      map(entries(data),
+        fn(entry): "\"" + first(entry) + "\": " + format_json_output(last(entry));), ", ") + "}"
+end
+
+def format_json_output(data):
+  if (is_string(data)):
+    format_json_string(data)
+  elif (is_number(data)):
+    to_string(data)
+  elif (is_bool(data)):
+    to_string(data)
+  elif (is_none(data)):
+    "null"
+  elif (is_array(data)):
+    format_json_array(data)
+  elif (is_dict(data)):
+    format_json_object(data)
+  else:
+    to_string(data)
+end
