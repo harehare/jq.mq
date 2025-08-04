@@ -10,6 +10,20 @@ An implementation of jq JSON processor written in the [mq](https://github.com/ha
 
 This project provides a implementation of the jq command-line JSON processor using the [mq](https://github.com/harehare/mq). It supports JSON parsing, querying, and transformation with a familiar jq-like syntax.
 
+## Installation
+
+To install `jq.mq`, simply copy the script to your `~/.mq` directory:
+
+```bash
+# Create the ~/.mq directory if it doesn't exist
+mkdir -p ~/.mq
+
+# Copy jq.mq to ~/.mq
+cp jq.mq ~/.mq/
+```
+
+Once copied, you can use `jq.mq` with the runner script as described below.
+
 ## Usage
 
 ### Using the Runner Script
