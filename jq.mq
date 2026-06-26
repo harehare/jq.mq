@@ -1,0 +1,1783 @@
+# jq.mq — A jq interpreter implemented in mq
+#
+# Evaluates jq expressions against arbitrary input values.
+# Since jq produces streams, all outputs are collected into arrays.
+#
+# API:
+#   jq_run(program, input)        -> array of outputs
+#   jq_run_first(program, input)  -> first output, or None
+#   jq_compile(program)           -> compiled AST
+#   jq_eval(ast, input)           -> array of outputs
+
+# ===== Utilities =====
+
+def _jq_hex_digit(c):
+  let cp = first(explode(c))
+  | if (cp >= 48 && cp <= 57): cp - 48
+    elif (cp >= 65 && cp <= 70): cp - 55
+    elif (cp >= 97 && cp <= 102): cp - 87
+    else: error("jq: invalid hex digit: " + c)
+end
+
+def _jq_hex_to_int(hex):
+  fold(to_array(downcase(hex)), 0, fn(acc, c): acc * 16 + _jq_hex_digit(c);)
+end
+
+def _jq_is_alpha(c):
+  is_regex_match(c, "^[a-zA-Z_]$")
+end
+
+def _jq_is_digit(c):
+  c >= "0" && c <= "9"
+end
+
+# ===== Lexer =====
+
+def _jq_lex_str_body(s, start):
+  var i = start
+  | var parts = []
+  | var cur = ""
+  | let n = len(s)
+  | let _ = while (i < n && s[i] != "\""):
+      if (s[i] == "\\" && i + 1 < n && s[i + 1] == "("):
+        do
+          if (cur != ""):
+            do parts += [{t: "text", v: cur}] | cur = "" | parts end
+          | var depth = 1
+          | var j = i + 2
+          | let _ = while (j < n && depth > 0):
+              if (s[j] == "("): do depth += 1 | j += 1 | depth end
+              elif (s[j] == ")"): do depth -= 1 | j += 1 | depth end
+              elif (s[j] == "\""):
+                do j += 1 | let _ = while (j < n && s[j] != "\""): j += 1 end | j += 1 | depth end
+              else: do j += 1 | depth end
+            end
+          | parts += [{t: "interp", v: slice(s, i + 2, j - 1)}]
+          | i = j
+          | parts
+        end
+      elif (s[i] == "\\"):
+        do
+          let nc = if (i + 1 < n): s[i + 1] else: ""
+          | if (nc == "n"): do cur = cur + "\n" | i += 2 | cur end
+            elif (nc == "r"): do cur = cur + "\r" | i += 2 | cur end
+            elif (nc == "t"): do cur = cur + "\t" | i += 2 | cur end
+            elif (nc == "\\"): do cur = cur + "\\" | i += 2 | cur end
+            elif (nc == "\""): do cur = cur + "\"" | i += 2 | cur end
+            elif (nc == "/"): do cur = cur + "/" | i += 2 | cur end
+            elif (nc == "b"): do cur = cur + implode([8]) | i += 2 | cur end
+            elif (nc == "f"): do cur = cur + implode([12]) | i += 2 | cur end
+            elif (nc == "u" && i + 5 <= n): do
+              let cp = _jq_hex_to_int(slice(s, i + 2, i + 6))
+              | cur = cur + implode([cp])
+              | i += 6
+              | cur
+            end
+            else: do cur = cur + nc | i += 2 | cur end
+        end
+      else: do cur = cur + s[i] | i += 1 | cur end
+    end
+  | if (cur != ""): parts += [{t: "text", v: cur}]
+  | {parts: parts, end_pos: i + 1}
+end
+
+def _jq_lex(src):
+  let s = to_string(src)
+  | var pos = 0
+  | var tokens = []
+  | let n = len(s)
+  | let kws = ["if", "then", "else", "elif", "end", "try", "catch", "reduce",
+               "foreach", "as", "def", "and", "or", "not", "import", "include",
+               "label", "break", "null", "true", "false"]
+  | let _ = while (pos < n):
+      let c = s[pos]
+      | if (c == " " || c == "\t" || c == "\n" || c == "\r"):
+          do pos += 1 | tokens end
+        elif (c == "#"):
+          do
+            let _ = while (pos < n && s[pos] != "\n"): pos += 1 end
+            | tokens
+          end
+        elif (c == "."):
+          do
+            if (pos + 1 < n && s[pos + 1] == "."):
+              do tokens += [{t: "dotdot"}] | pos += 2 | tokens end
+            elif (pos + 1 < n && _jq_is_digit(s[pos + 1])):
+              do
+                let m = first(regex_match(slice(s, pos, n), "^\\.[0-9]+(?:[eE][+-]?[0-9]+)?"))
+                | tokens += [{t: "num", v: to_number(m)}]
+                | pos += len(m)
+                | tokens
+              end
+            else: do tokens += [{t: "dot"}] | pos += 1 | tokens end
+          end
+        elif (c == "|"): do tokens += [{t: "pipe"}] | pos += 1 | tokens end
+        elif (c == ","): do tokens += [{t: "comma"}] | pos += 1 | tokens end
+        elif (c == ":"): do tokens += [{t: "colon"}] | pos += 1 | tokens end
+        elif (c == ";"): do tokens += [{t: "semi"}] | pos += 1 | tokens end
+        elif (c == "("): do tokens += [{t: "lparen"}] | pos += 1 | tokens end
+        elif (c == ")"): do tokens += [{t: "rparen"}] | pos += 1 | tokens end
+        elif (c == "["): do tokens += [{t: "lbracket"}] | pos += 1 | tokens end
+        elif (c == "]"): do tokens += [{t: "rbracket"}] | pos += 1 | tokens end
+        elif (c == "{"): do tokens += [{t: "lbrace"}] | pos += 1 | tokens end
+        elif (c == "}"): do tokens += [{t: "rbrace"}] | pos += 1 | tokens end
+        elif (c == "?"): do tokens += [{t: "question"}] | pos += 1 | tokens end
+        elif (c == "@"):
+          do
+            let rest = slice(s, pos + 1, n)
+            | let ms = regex_match(rest, "^[a-zA-Z][a-zA-Z0-9]*")
+            | if (is_empty(ms)): error("jq: invalid format string after @")
+            | tokens += [{t: "format", v: ms[0]}]
+            | pos += 1 + len(ms[0])
+            | tokens
+          end
+        elif (c == "$"):
+          do
+            let rest = slice(s, pos + 1, n)
+            | let ms = regex_match(rest, "^[a-zA-Z_][a-zA-Z0-9_]*")
+            | if (is_empty(ms)): error("jq: invalid variable name after $")
+            | tokens += [{t: "var", v: ms[0]}]
+            | pos += 1 + len(ms[0])
+            | tokens
+          end
+        elif (c == "="):
+          do
+            if (pos + 1 < n && s[pos + 1] == "="):
+              do tokens += [{t: "op", v: "=="}] | pos += 2 | tokens end
+            else: do tokens += [{t: "assign"}] | pos += 1 | tokens end
+          end
+        elif (c == "!"):
+          do
+            if (pos + 1 < n && s[pos + 1] == "="):
+              do tokens += [{t: "op", v: "!="}] | pos += 2 | tokens end
+            else: error("jq: unexpected '!'")
+          end
+        elif (c == "<"):
+          do
+            if (pos + 1 < n && s[pos + 1] == "="):
+              do tokens += [{t: "op", v: "<="}] | pos += 2 | tokens end
+            else: do tokens += [{t: "op", v: "<"}] | pos += 1 | tokens end
+          end
+        elif (c == ">"):
+          do
+            if (pos + 1 < n && s[pos + 1] == "="):
+              do tokens += [{t: "op", v: ">="}] | pos += 2 | tokens end
+            else: do tokens += [{t: "op", v: ">"}] | pos += 1 | tokens end
+          end
+        elif (c == "+"): do tokens += [{t: "op", v: "+"}] | pos += 1 | tokens end
+        elif (c == "-"): do tokens += [{t: "op", v: "-"}] | pos += 1 | tokens end
+        elif (c == "*"): do tokens += [{t: "op", v: "*"}] | pos += 1 | tokens end
+        elif (c == "/"):
+          do
+            if (pos + 1 < n && s[pos + 1] == "/"):
+              do tokens += [{t: "op", v: "//"}] | pos += 2 | tokens end
+            else: do tokens += [{t: "op", v: "/"}] | pos += 1 | tokens end
+          end
+        elif (c == "%"): do tokens += [{t: "op", v: "%"}] | pos += 1 | tokens end
+        elif (c == "\""):
+          do
+            let r = _jq_lex_str_body(s, pos + 1)
+            | tokens += [{t: "str", parts: r["parts"]}]
+            | pos = r["end_pos"]
+            | tokens
+          end
+        elif (_jq_is_digit(c)):
+          do
+            let rest = slice(s, pos, n)
+            | let ms = regex_match(rest, "^(?:0[xX][0-9a-fA-F]+|[0-9]+(?:\\.[0-9]*)?(?:[eE][+-]?[0-9]+)?)")
+            | let m = ms[0]
+            | let v = if (starts_with(m, "0x") || starts_with(m, "0X")):
+                to_number(_jq_hex_to_int(slice(m, 2, len(m))))
+              else: to_number(m)
+            | tokens += [{t: "num", v: v}]
+            | pos += len(m)
+            | tokens
+          end
+        elif (_jq_is_alpha(c)):
+          do
+            let rest = slice(s, pos, n)
+            | let ms = regex_match(rest, "^[a-zA-Z_][a-zA-Z0-9_]*")
+            | let m = ms[0]
+            | let tok = if (contains(kws, m)): {t: "kw", v: m} else: {t: "ident", v: m}
+            | tokens += [tok]
+            | pos += len(m)
+            | tokens
+          end
+        else: error("jq: unexpected character: '" + c + "'")
+    end
+  | tokens
+end
+
+# ===== Parser Helpers =====
+
+def _jq_tt(tokens, pos):
+  if (pos >= len(tokens)): "eof" else: tokens[pos]["t"]
+end
+
+def _jq_tv(tokens, pos):
+  if (pos >= len(tokens)): None else: tokens[pos]["v"]
+end
+
+def _jq_is_kw(tokens, pos, v):
+  _jq_tt(tokens, pos) == "kw" && _jq_tv(tokens, pos) == v
+end
+
+def _jq_expect(tokens, pos, tt):
+  if (_jq_tt(tokens, pos) != tt):
+    error("jq: expected '" + tt + "' but got '" + _jq_tt(tokens, pos) + "'")
+  else: pos + 1
+end
+
+def _jq_expect_kw(tokens, pos, v):
+  if (!_jq_is_kw(tokens, pos, v)):
+    error("jq: expected '" + v + "' but got '" + _jq_tt(tokens, pos) + ":" + to_string(_jq_tv(tokens, pos)) + "'")
+  else: pos + 1
+end
+
+# ===== Parser =====
+
+def _jq_parse_str_tok(tok, pos):
+  let parts = tok["parts"]
+  | if (is_empty(parts)): [{type: "literal", value: ""}, pos]
+    elif (len(parts) == 1 && parts[0]["t"] == "text"): [{type: "literal", value: parts[0]["v"]}, pos]
+    else: [{type: "interp_str", parts: parts}, pos]
+end
+
+def _jq_parse_func_call(tokens, pos):
+  let name = _jq_tv(tokens, pos)
+  | if (_jq_tt(tokens, pos + 1) == "lparen"): do
+      var args = []
+      | var cur = pos + 2
+      | let _ = while (_jq_tt(tokens, cur) != "rparen" && _jq_tt(tokens, cur) != "eof"):
+          do
+            let r = _jq_parse_pipe(tokens, cur)
+            | args += [r[0]]
+            | cur = r[1]
+            | if (_jq_tt(tokens, cur) == "semi"): do cur += 1 | args end
+              else: args
+          end
+        end
+      | let end_pos = _jq_expect(tokens, cur, "rparen")
+      | [{type: "call", name: name, args: args}, end_pos]
+    end
+    else: [{type: "call", name: name, args: []}, pos + 1]
+end
+
+def _jq_parse_array_ctor(tokens, pos):
+  if (_jq_tt(tokens, pos) == "rbracket"):
+    [{type: "array", expr: {type: "literal", value: None}}, pos + 1]
+  else: do
+    let r = _jq_parse_pipe(tokens, pos)
+    | let end_pos = _jq_expect(tokens, r[1], "rbracket")
+    | [{type: "array", expr: r[0]}, end_pos]
+  end
+end
+
+def _jq_parse_object_field(tokens, pos):
+  let tt = _jq_tt(tokens, pos)
+  | let tv = _jq_tv(tokens, pos)
+  | if (tt == "ident" || tt == "kw"): do
+      let key_name = tv
+      | if (_jq_tt(tokens, pos + 1) == "colon"): do
+          let r = _jq_parse_pipe_nc(tokens, pos + 2)
+          | [{key: {type: "literal", value: key_name}, value: r[0]}, r[1]]
+        end
+        else: [{key: {type: "literal", value: key_name},
+                value: {type: "field", name: key_name}}, pos + 1]
+    end
+    elif (tt == "str"): do
+      let key_r = _jq_parse_str_tok(tokens[pos], pos + 1)
+      | let end_pos = _jq_expect(tokens, key_r[1], "colon")
+      | let val_r = _jq_parse_pipe_nc(tokens, end_pos)
+      | [{key: key_r[0], value: val_r[0]}, val_r[1]]
+    end
+    elif (tt == "lparen"): do
+      let key_r = _jq_parse_pipe(tokens, pos + 1)
+      | let end_pos = _jq_expect(tokens, key_r[1], "rparen")
+      | let end_pos2 = _jq_expect(tokens, end_pos, "colon")
+      | let val_r = _jq_parse_pipe_nc(tokens, end_pos2)
+      | [{key: key_r[0], computed: true, value: val_r[0]}, val_r[1]]
+    end
+    else: error("jq: expected object key, got '" + tt + "'")
+end
+
+def _jq_parse_object_ctor(tokens, pos):
+  var fields = []
+  | var cur = pos
+  | let _ = while (_jq_tt(tokens, cur) != "rbrace" && _jq_tt(tokens, cur) != "eof"):
+      do
+        let r = _jq_parse_object_field(tokens, cur)
+        | fields += [r[0]]
+        | cur = r[1]
+        | if (_jq_tt(tokens, cur) == "comma"): do cur += 1 | fields end
+          else: fields
+      end
+    end
+  | let end_pos = _jq_expect(tokens, cur, "rbrace")
+  | [{type: "object", fields: fields}, end_pos]
+end
+
+def _jq_parse_if(tokens, pos):
+  let r_cond = _jq_parse_pipe(tokens, pos)
+  | let pos2 = _jq_expect_kw(tokens, r_cond[1], "then")
+  | let r_then = _jq_parse_pipe(tokens, pos2)
+  | var branches = [{cond: r_cond[0], then: r_then[0]}]
+  | var cur = r_then[1]
+  | let _ = while (_jq_is_kw(tokens, cur, "elif")):
+      do
+        let r_ec = _jq_parse_pipe(tokens, cur + 1)
+        | let pos_et = _jq_expect_kw(tokens, r_ec[1], "then")
+        | let r_et = _jq_parse_pipe(tokens, pos_et)
+        | branches += [{cond: r_ec[0], then: r_et[0]}]
+        | cur = r_et[1]
+        | branches
+      end
+    end
+  | let else_r = if (_jq_is_kw(tokens, cur, "else")): do
+      let r_else = _jq_parse_pipe(tokens, cur + 1)
+      | [r_else[0], r_else[1]]
+    end
+    else: [{type: "literal", value: None}, cur]
+  | let end_pos = _jq_expect_kw(tokens, else_r[1], "end")
+  | [{type: "if", branches: branches, else_expr: else_r[0]}, end_pos]
+end
+
+def _jq_parse_try(tokens, pos):
+  let r = _jq_parse_binop(tokens, pos)
+  | if (_jq_is_kw(tokens, r[1], "catch")): do
+      let r2 = _jq_parse_binop(tokens, r[1] + 1)
+      | [{type: "try_catch", expr: r[0], handler: r2[0]}, r2[1]]
+    end
+    else: [{type: "try_catch", expr: r[0], handler: None}, r[1]]
+end
+
+def _jq_parse_reduce(tokens, pos):
+  let r_gen = _jq_parse_pipe_nc(tokens, pos)
+  | let pos2 = _jq_expect_kw(tokens, r_gen[1], "as")
+  | if (_jq_tt(tokens, pos2) != "var"): error("jq: expected $var in reduce")
+    | let var_name = _jq_tv(tokens, pos2)
+  | let pos3 = _jq_expect(tokens, pos2 + 1, "lparen")
+  | let r_init = _jq_parse_pipe(tokens, pos3)
+  | let pos4 = _jq_expect(tokens, r_init[1], "semi")
+  | let r_body = _jq_parse_pipe(tokens, pos4)
+  | let end_pos = _jq_expect(tokens, r_body[1], "rparen")
+  | [{type: "reduce", gen: r_gen[0], "var": var_name, init: r_init[0], body: r_body[0]}, end_pos]
+end
+
+def _jq_parse_foreach(tokens, pos):
+  let r_gen = _jq_parse_pipe_nc(tokens, pos)
+  | let pos2 = _jq_expect_kw(tokens, r_gen[1], "as")
+  | if (_jq_tt(tokens, pos2) != "var"): error("jq: expected $var in foreach")
+    | let var_name = _jq_tv(tokens, pos2)
+  | let pos3 = _jq_expect(tokens, pos2 + 1, "lparen")
+  | let r_init = _jq_parse_pipe(tokens, pos3)
+  | let pos4 = _jq_expect(tokens, r_init[1], "semi")
+  | let r_update = _jq_parse_pipe(tokens, pos4)
+  | if (_jq_tt(tokens, r_update[1]) == "semi"): do
+      let r_extract = _jq_parse_pipe(tokens, r_update[1] + 1)
+      | let end_pos = _jq_expect(tokens, r_extract[1], "rparen")
+      | [{type: "foreach", gen: r_gen[0], "var": var_name, init: r_init[0],
+          update: r_update[0], extract: r_extract[0]}, end_pos]
+    end
+    else: do
+      let end_pos = _jq_expect(tokens, r_update[1], "rparen")
+      | [{type: "foreach", gen: r_gen[0], "var": var_name, init: r_init[0],
+          update: r_update[0], extract: None}, end_pos]
+    end
+end
+
+def _jq_parse_label(tokens, pos):
+  if (_jq_tt(tokens, pos) != "var"): error("jq: expected $label after 'label'")
+  | let lname = _jq_tv(tokens, pos)
+  | let pos2 = _jq_expect(tokens, pos + 1, "pipe")
+  | let r = _jq_parse_pipe(tokens, pos2)
+  | [{type: "label_break", label: lname, body: r[0]}, r[1]]
+end
+
+def _jq_parse_primary(tokens, pos):
+  let tt = _jq_tt(tokens, pos)
+  | let tv = _jq_tv(tokens, pos)
+  | if (tt == "dot"): do
+      let next_tt = _jq_tt(tokens, pos + 1)
+      | let next_tv = _jq_tv(tokens, pos + 1)
+      | if (next_tt == "ident"): do
+          let name = next_tv
+          | if (_jq_tt(tokens, pos + 2) == "question"):
+              [{type: "field_opt", name: name}, pos + 3]
+            else: [{type: "field", name: name}, pos + 2]
+        end
+        elif (next_tt == "lbracket"): _jq_parse_index_suffix(tokens, pos + 1, {type: "identity"})
+        else: [{type: "identity"}, pos + 1]
+    end
+    elif (tt == "dotdot"): [{type: "recurse_all"}, pos + 1]
+    elif (tt == "kw" && tv == "null"): [{type: "literal", value: None}, pos + 1]
+    elif (tt == "kw" && tv == "true"): [{type: "literal", value: true}, pos + 1]
+    elif (tt == "kw" && tv == "false"): [{type: "literal", value: false}, pos + 1]
+    elif (tt == "num"): [{type: "literal", value: tv}, pos + 1]
+    elif (tt == "str"): _jq_parse_str_tok(tokens[pos], pos + 1)
+    elif (tt == "format"): do
+      let fmt = tv
+      | if (_jq_tt(tokens, pos + 1) == "str"): do
+          let r = _jq_parse_str_tok(tokens[pos + 1], pos + 2)
+          | [{type: "fmt_str", fmt: fmt, inner: r[0]}, r[1]]
+        end
+        else: [{type: "fmt_apply", fmt: fmt}, pos + 1]
+    end
+    elif (tt == "var"): [{type: "var_ref", name: tv}, pos + 1]
+    elif (tt == "kw" && tv == "if"): _jq_parse_if(tokens, pos + 1)
+    elif (tt == "kw" && tv == "try"): _jq_parse_try(tokens, pos + 1)
+    elif (tt == "kw" && tv == "reduce"): _jq_parse_reduce(tokens, pos + 1)
+    elif (tt == "kw" && tv == "foreach"): _jq_parse_foreach(tokens, pos + 1)
+    elif (tt == "kw" && tv == "label"): _jq_parse_label(tokens, pos + 1)
+    elif (tt == "kw" && tv == "break"): do
+      if (_jq_tt(tokens, pos + 1) != "var"): error("jq: expected $label after 'break'")
+      | [{type: "break_out", label: _jq_tv(tokens, pos + 1)}, pos + 2]
+    end
+    elif (tt == "kw" && tv == "not"): [{type: "not_expr"}, pos + 1]
+    elif (tt == "lparen"): do
+      let r = _jq_parse_pipe(tokens, pos + 1)
+      | let end_pos = _jq_expect(tokens, r[1], "rparen")
+      | [r[0], end_pos]
+    end
+    elif (tt == "lbracket"): _jq_parse_array_ctor(tokens, pos + 1)
+    elif (tt == "lbrace"): _jq_parse_object_ctor(tokens, pos + 1)
+    elif (tt == "ident"): _jq_parse_func_call(tokens, pos)
+    else: error("jq: unexpected token '" + tt + "'" + if (is_none(tv)): "" else: " (value: " + to_string(tv) + ")")
+end
+
+def _jq_parse_index_suffix(tokens, pos, base):
+  if (_jq_tt(tokens, pos) != "lbracket"): [base, pos]
+  else: do
+    let pos2 = pos + 1
+    | if (_jq_tt(tokens, pos2) == "rbracket"): do
+        let node = {type: "iter_all", base: base}
+        | let q = if (_jq_tt(tokens, pos2 + 1) == "question"):
+            [{type: "optional_expr", inner: node}, pos2 + 2]
+          else: [node, pos2 + 1]
+        | _jq_parse_postfix_chain(tokens, q[1], q[0])
+      end
+      elif (_jq_tt(tokens, pos2) == "colon"): do
+        let r_to = _jq_parse_pipe_nc(tokens, pos2 + 1)
+        | let end_pos = _jq_expect(tokens, r_to[1], "rbracket")
+        | let node = {type: "slice", base: base, from: None, to: r_to[0]}
+        | _jq_parse_postfix_chain(tokens, end_pos, node)
+      end
+      else: do
+        let r_idx = _jq_parse_pipe_nc(tokens, pos2)
+        | if (_jq_tt(tokens, r_idx[1]) == "colon"): do
+            let pos3 = r_idx[1] + 1
+            | if (_jq_tt(tokens, pos3) == "rbracket"): do
+                let node = {type: "slice", base: base, from: r_idx[0], to: None}
+                | _jq_parse_postfix_chain(tokens, pos3 + 1, node)
+              end
+              else: do
+                let r_to = _jq_parse_pipe_nc(tokens, pos3)
+                | let end_pos = _jq_expect(tokens, r_to[1], "rbracket")
+                | let node = {type: "slice", base: base, from: r_idx[0], to: r_to[0]}
+                | _jq_parse_postfix_chain(tokens, end_pos, node)
+              end
+          end
+          else: do
+            let end_pos = _jq_expect(tokens, r_idx[1], "rbracket")
+            | let node = {type: "index", base: base, idx: r_idx[0]}
+            | let q = if (_jq_tt(tokens, end_pos) == "question"):
+                [{type: "optional_expr", inner: node}, end_pos + 1]
+              else: [node, end_pos]
+            | _jq_parse_postfix_chain(tokens, q[1], q[0])
+          end
+      end
+  end
+end
+
+def _jq_parse_postfix_chain(tokens, pos, node):
+  if (_jq_tt(tokens, pos) == "dot"): do
+      let next_tt = _jq_tt(tokens, pos + 1)
+      | let next_tv = _jq_tv(tokens, pos + 1)
+      | if (next_tt == "ident"): do
+          let new_node = {type: "field", name: next_tv, base: node}
+          | let next_pos = pos + 2
+          | let qnode = if (_jq_tt(tokens, next_pos) == "question"):
+              [{type: "optional_expr", inner: new_node}, next_pos + 1]
+            else: [new_node, next_pos]
+          | _jq_parse_postfix_chain(tokens, qnode[1], qnode[0])
+        end
+        elif (next_tt == "lbracket"): _jq_parse_index_suffix(tokens, pos + 1, node)
+        else: [node, pos]
+    end
+    elif (_jq_tt(tokens, pos) == "lbracket"): _jq_parse_index_suffix(tokens, pos, node)
+    elif (_jq_tt(tokens, pos) == "question"):
+      _jq_parse_postfix_chain(tokens, pos + 1, {type: "optional_expr", inner: node})
+    else: [node, pos]
+end
+
+def _jq_parse_unary(tokens, pos):
+  if (_jq_tt(tokens, pos) == "op" && _jq_tv(tokens, pos) == "-"): do
+    let r = _jq_parse_unary(tokens, pos + 1)
+    | [{type: "neg", inner: r[0]}, r[1]]
+  end
+  else: do
+    let r = _jq_parse_primary(tokens, pos)
+    | _jq_parse_postfix_chain(tokens, r[1], r[0])
+  end
+end
+
+# Returns numeric precedence for a binary op token (higher = tighter binding), -1 if not binary op
+def _jq_binop_prec(tt, tv):
+  if (tt == "op" && tv == "//"): 1
+  elif (tt == "kw" && tv == "or"): 2
+  elif (tt == "kw" && tv == "and"): 3
+  elif (tt == "op" && (tv == "==" || tv == "!=" || tv == "<" || tv == ">" || tv == "<=" || tv == ">=")):  4
+  elif (tt == "op" && (tv == "+" || tv == "-")): 5
+  elif (tt == "op" && (tv == "*" || tv == "/" || tv == "%")): 6
+  else: -1
+end
+
+# Pratt precedence-climbing: consume binary ops at >= min_prec, recursing for higher-prec rhs
+def _jq_binop_climb(tokens, pos, lhs, min_prec):
+  var left = lhs
+  | var cur = pos
+  | let _ = while (_jq_binop_prec(_jq_tt(tokens, cur), _jq_tv(tokens, cur)) >= min_prec):
+      do
+        let prec = _jq_binop_prec(_jq_tt(tokens, cur), _jq_tv(tokens, cur))
+        | let op = _jq_tv(tokens, cur)
+        | let r = _jq_parse_unary(tokens, cur + 1)
+        | let rhs_r = _jq_binop_climb(tokens, r[1], r[0], prec + 1)
+        | left = if (op == "//"): {type: "alt_op", left: left, right: rhs_r[0]}
+                 else: {type: "binop", op: op, left: left, right: rhs_r[0]}
+        | cur = rhs_r[1]
+        | left
+      end
+    end
+  | [left, cur]
+end
+
+# Entry point for binary-operator parsing (all precedence levels)
+def _jq_parse_binop(tokens, pos):
+  let r = _jq_parse_unary(tokens, pos)
+  | _jq_binop_climb(tokens, r[1], r[0], 0)
+end
+
+# Parse expression without top-level comma (for object values, etc.)
+def _jq_parse_pipe_nc(tokens, pos):
+  if (_jq_is_kw(tokens, pos, "try")): _jq_parse_try(tokens, pos + 1)
+  else: _jq_parse_binop(tokens, pos)
+end
+
+def _jq_parse_comma_expr(tokens, pos):
+  let r1 = _jq_parse_pipe_nc(tokens, pos)
+  | var left = r1[0]
+  | var cur = r1[1]
+  | let _ = while (_jq_tt(tokens, cur) == "comma"):
+      do
+        let r2 = _jq_parse_pipe_nc(tokens, cur + 1)
+        | left = {type: "comma_op", left: left, right: r2[0]}
+        | cur = r2[1]
+        | left
+      end
+    end
+  | [left, cur]
+end
+
+def _jq_parse_pipe(tokens, pos):
+  let r1 = _jq_parse_comma_expr(tokens, pos)
+  | let left = r1[0]
+  | let pos1 = r1[1]
+  | if (_jq_is_kw(tokens, pos1, "as")): do
+      if (_jq_tt(tokens, pos1 + 1) != "var"): error("jq: expected $var after 'as'")
+      | let var_name = _jq_tv(tokens, pos1 + 1)
+      | let pos2 = _jq_expect(tokens, pos1 + 2, "pipe")
+      | let r2 = _jq_parse_pipe(tokens, pos2)
+      | [{type: "binding", expr: left, "var": var_name, body: r2[0]}, r2[1]]
+    end
+    elif (_jq_tt(tokens, pos1) == "pipe"): do
+      let r2 = _jq_parse_pipe(tokens, pos1 + 1)
+      | [{type: "pipe", left: left, right: r2[0]}, r2[1]]
+    end
+    else: [left, pos1]
+end
+
+def _jq_parse_def(tokens, pos):
+  if (_jq_tt(tokens, pos) != "ident"): error("jq: expected function name in def")
+  | let fname = _jq_tv(tokens, pos)
+  | let params_r = if (_jq_tt(tokens, pos + 1) == "lparen"): do
+      var plist = []
+      | var cur = pos + 2
+      | let _ = while (_jq_tt(tokens, cur) != "rparen" && _jq_tt(tokens, cur) != "eof"):
+          do
+            if (_jq_tt(tokens, cur) == "ident" || _jq_tt(tokens, cur) == "var"):
+              do plist += [_jq_tv(tokens, cur)] | cur += 1 | plist end
+            | if (_jq_tt(tokens, cur) == "semi"):
+                do cur += 1 | plist end
+              else: plist
+          end
+        end
+      | let end_pos = _jq_expect(tokens, cur, "rparen")
+      | [plist, end_pos]
+    end
+    else: [[], pos + 1]
+  | let pos2 = _jq_expect(tokens, params_r[1], "colon")
+  | let r_body = _jq_parse_pipe(tokens, pos2)
+  | let pos3 = _jq_expect(tokens, r_body[1], "semi")
+  | let r_next = _jq_parse_program(tokens, pos3)
+  | [{type: "def_fn", name: fname, params: params_r[0], body: r_body[0], next: r_next[0]}, r_next[1]]
+end
+
+def _jq_parse_program(tokens, pos):
+  if (_jq_is_kw(tokens, pos, "def")): _jq_parse_def(tokens, pos + 1)
+  else: _jq_parse_pipe(tokens, pos)
+end
+
+def _jq_parse(src):
+  let tokens = _jq_lex(src)
+  | let r = _jq_parse_program(tokens, 0)
+  | if (_jq_tt(tokens, r[1]) != "eof"):
+      error("jq: unexpected trailing tokens")
+    else: r[0]
+end
+
+# ===== Evaluator Helpers =====
+
+def _jq_env_new():
+  {vars: dict(), fns: dict()}
+end
+
+def _jq_env_set_var(env, name, val):
+  set(env, "vars", set(env["vars"], name, val))
+end
+
+def _jq_env_get_var(env, name):
+  env["vars"][name]
+end
+
+def _jq_env_add_fn(env, name, arity, params, body):
+  let key = name + "/" + to_string(arity)
+  | set(env, "fns", set(env["fns"], key, {params: params, body: body}))
+end
+
+def _jq_env_get_fn(env, name, arity):
+  env["fns"][name + "/" + to_string(arity)]
+end
+
+def _jq_truthy(v):
+  !is_none(v) && v != false
+end
+
+def _jq_type(v):
+  let t = type(v)
+  | if (t == "dict"): "object"
+    elif (t == "bool"): "boolean"
+    elif (t == "None"): "null"
+    else: t
+end
+
+def _jq_add_values(a, b):
+  let ta = _jq_type(a)
+  | let tb = _jq_type(b)
+  | if (ta == "null"): b
+    elif (tb == "null"): a
+    elif (ta == "number" && tb == "number"): a + b
+    elif (ta == "string" && tb == "string"): a + b
+    elif (ta == "array" && tb == "array"): a + b
+    elif (ta == "object" && tb == "object"):
+      fold(keys(b), a, fn(acc, k): set(acc, k, b[k]);)
+    else: error("jq: cannot add " + ta + " and " + tb)
+end
+
+def _jq_sub_values(a, b):
+  let ta = _jq_type(a)
+  | if (ta == "number"): a - b
+    elif (ta == "array"):
+      fold(a, [], fn(acc, x): if (contains(b, x)): acc else: acc + [x];)
+    else: error("jq: cannot subtract from " + ta)
+end
+
+def _jq_mul_values(a, b):
+  let ta = _jq_type(a)
+  | let tb = _jq_type(b)
+  | if (ta == "number" && tb == "number"): a * b
+    elif (ta == "string" && tb == "number"):
+      if (b <= 0): None
+      else: fold(range(to_number(b) - 1), "", fn(acc, _): acc + a;)
+    elif (ta == "object" && tb == "object"):
+      fold(keys(b), a, fn(acc, k):
+        if (is_none(acc[k])): set(acc, k, b[k])
+        elif (_jq_type(acc[k]) == "object" && _jq_type(b[k]) == "object"):
+          set(acc, k, _jq_mul_values(acc[k], b[k]))
+        else: set(acc, k, b[k])
+      ;)
+    else: error("jq: cannot multiply " + ta + " and " + tb)
+end
+
+def _jq_div_values(a, b):
+  let ta = _jq_type(a)
+  | if (ta == "number"): a / b
+    elif (ta == "string"): split(a, b)
+    else: error("jq: cannot divide " + ta)
+end
+
+def _jq_cmp_values(a, b):
+  let ta = _jq_type(a)
+  | let tb = _jq_type(b)
+  | let order = ["null", "boolean", "number", "string", "array", "object"]
+  | if (ta != tb): do
+      let ia = index(order, ta)
+      | let ib = index(order, tb)
+      | if (ia < ib): -1 else: 1
+    end
+    elif (ta == "null"): 0
+    elif (ta == "boolean"):
+      if (a == b): 0 elif (!a && b): -1 else: 1
+    elif (ta == "number"):
+      if (a < b): -1 elif (a > b): 1 else: 0
+    elif (ta == "string"):
+      if (a < b): -1 elif (a > b): 1 else: 0
+    elif (ta == "array"): do
+      var i = 0
+      | var res = 0
+      | let min_len = if (len(a) < len(b)): len(a) else: len(b)
+      | let _ = while (i < min_len && res == 0):
+          do let c = _jq_cmp_values(a[i], b[i]) | res = c | i += 1 | res end
+        end
+      | if (res != 0): res
+        elif (len(a) < len(b)): -1
+        elif (len(a) > len(b)): 1
+        else: 0
+    end
+    else: 0
+end
+
+def _jq_get_index(v, idx):
+  let tv = _jq_type(v)
+  | if (tv == "array"): do
+      let n = len(v)
+      | let i = to_number(idx)
+      | let real_i = if (i < 0): n + i else: i
+      | if (real_i < 0 || real_i >= n): None else: v[real_i]
+    end
+    elif (tv == "object"): v[to_string(idx)]
+    elif (tv == "null"): None
+    else: error("jq: cannot index " + tv + " with " + _jq_type(idx))
+end
+
+def _jq_get_slice(v, from_v, to_v):
+  let tv = _jq_type(v)
+  | if (tv == "array" || tv == "string"): do
+      let n = len(v)
+      | let f = if (is_none(from_v)): 0
+                elif (from_v < 0): if (n + from_v < 0): 0 else: n + from_v
+                elif (from_v > n): n
+                else: from_v
+      | let t = if (is_none(to_v)): n
+                elif (to_v < 0): if (n + to_v < 0): 0 else: n + to_v
+                elif (to_v > n): n
+                else: to_v
+      | slice(v, f, t)
+    end
+    else: error("jq: cannot slice " + tv)
+end
+
+def _jq_iter_values(v):
+  let tv = _jq_type(v)
+  | if (tv == "array"): v
+    elif (tv == "object"): values(v)
+    else: error("jq: cannot iterate over " + tv)
+end
+
+def _jq_recurse_collect(v):
+  var results = [v]
+  | var queue = [v]
+  | let _ = while (!is_empty(queue)):
+      do
+        let head = queue[0]
+        | let rest = slice(queue, 1, len(queue))
+        | let children = try: _jq_iter_values(head) catch: []
+        | results = results + children
+        | queue = rest + children
+        | results
+      end
+    end
+  | results
+end
+
+def _jq_format_apply(fmt, v):
+  if (fmt == "json"): to_string(v)
+  elif (fmt == "text"): if (is_none(v)): "" else: to_string(v)
+  elif (fmt == "html"): do
+    let s = to_string(v)
+    | replace(replace(replace(replace(replace(s, "&", "&amp;"), "<", "&lt;"), ">", "&gt;"), "\"", "&quot;"), "'", "&#39;")
+  end
+  elif (fmt == "uri"): url_encode(to_string(v))
+  elif (fmt == "csv"): do
+    let arr = if (_jq_type(v) == "array"): v else: [v]
+    | let parts = map(arr, fn(x):
+        let t = _jq_type(x)
+        | if (t == "string"): "\"" + replace(x, "\"", "\"\"") + "\""
+          elif (t == "null"): ""
+          else: to_string(x)
+      ;)
+    | join(parts, ",")
+  end
+  elif (fmt == "tsv"): do
+    let arr = if (_jq_type(v) == "array"): v else: [v]
+    | join(map(arr, fn(x): to_string(x);), "\t")
+  end
+  elif (fmt == "sh"): do
+    let s = to_string(v)
+    | "'" + replace(s, "'", "'\\''") + "'"
+  end
+  elif (fmt == "base64"): to_text(to_bytes(to_string(v)))
+  else: error("jq: unknown format: " + fmt)
+end
+
+def _jq_get_at_path(v, path):
+  if (is_empty(path)): v
+  else: do
+    let h = path[0]
+    | let rest = slice(path, 1, len(path))
+    | _jq_get_at_path(_jq_get_index(v, h), rest)
+  end
+end
+
+def _jq_set_at_path(v, path, val):
+  if (is_empty(path)): val
+  else: do
+    let h = path[0]
+    | let rest = slice(path, 1, len(path))
+    | let tv = _jq_type(v)
+    | if (tv == "null" || tv == "object"): do
+        let cur = if (is_none(v)): dict() else: v
+        | let sub = _jq_get_index(cur, h)
+        | let new_sub = _jq_set_at_path(sub, rest, val)
+        | set(cur, to_string(h), new_sub)
+      end
+      elif (tv == "array"): do
+        let idx = to_number(h)
+        | let n = len(v)
+        | let real_idx = if (idx < 0): n + idx else: idx
+        | let sub = if (real_idx >= 0 && real_idx < n): v[real_idx] else: None
+        | let new_sub = _jq_set_at_path(sub, rest, val)
+        | update(v, real_idx, new_sub)
+      end
+      else: error("jq: cannot set path in " + tv)
+  end
+end
+
+def _jq_del_at_path(v, path):
+  if (is_empty(path)): None
+  else: do
+    let h = path[0]
+    | let rest = slice(path, 1, len(path))
+    | let tv = _jq_type(v)
+    | if (tv == "object"): do
+        if (is_empty(rest)): del(v, to_string(h))
+        else: do
+          let sub = v[to_string(h)]
+          | set(v, to_string(h), _jq_del_at_path(sub, rest))
+        end
+      end
+      elif (tv == "array"): do
+        let idx = to_number(h)
+        | let n = len(v)
+        | let real_idx = if (idx < 0): n + idx else: idx
+        | if (is_empty(rest)): do
+            let front = slice(v, 0, real_idx)
+            | let back = slice(v, real_idx + 1, n)
+            | front + back
+          end
+          else: do
+            let sub = v[real_idx]
+            | update(v, real_idx, _jq_del_at_path(sub, rest))
+          end
+      end
+      else: v
+  end
+end
+
+# ===== Evaluator =====
+
+def _jq_eval_str_parts(parts, input, env):
+  fold(parts, "", fn(acc, part):
+    if (part["t"] == "text"): acc + part["v"]
+    else: do
+      let inner_ast = _jq_parse(part["v"])
+      | let results = _jq_eval(inner_ast, input, env)
+      | let v = if (is_empty(results)): None else: results[0]
+      | let s = if (is_none(v)): "null"
+                elif (_jq_type(v) == "string"): v
+                else: to_string(v)
+      | acc + s
+    end
+  ;)
+end
+
+def _jq_eval_fields(fields, input, env):
+  var result = dict()
+  | var i = 0
+  | let _ = while (i < len(fields)):
+      do
+        let field = fields[i]
+        | let key_results = _jq_eval(field["key"], input, env)
+        | let k = if (is_empty(key_results)): None else: to_string(key_results[0])
+        | let val_results = _jq_eval(field["value"], input, env)
+        | let v = if (is_empty(val_results)): None else: val_results[0]
+        | if (!is_none(k)): do result = set(result, k, v) | i += 1 | result end
+          else: do i += 1 | result end
+      end
+    end
+  | result
+end
+
+def _jq_eval_user_fn(fn_def, arg_asts, input, env):
+  let params = fn_def["params"]
+  | let body = fn_def["body"]
+  | var new_env = env
+  | let _ = map(range(len(params) - 1), fn(i):
+      let pname = params[i]
+      | let arg_ast = if (i < len(arg_asts)): arg_asts[i]
+                      else: {type: "literal", value: None}
+      | new_env = _jq_env_add_fn(new_env, pname, 0, [], arg_ast)
+      | new_env
+    ;)
+  | _jq_eval(body, input, new_env)
+end
+
+def _jq_eval_builtin(name, arg_asts, input, env):
+  let arity = len(arg_asts)
+  | let get_arg = fn(i):
+      let r = _jq_eval(arg_asts[i], input, env)
+      | if (is_empty(r)): None else: r[0]
+  ;
+  | if (name == "empty"): []
+    elif (name == "error"): do
+      let msg = if (arity == 0): "null" else: to_string(get_arg(0))
+      | error(msg)
+    end
+    elif (name == "type"): [_jq_type(input)]
+    elif (name == "length"): do
+      let t = _jq_type(input)
+      | if (t == "null"): [0]
+        elif (t == "string"): [len(input)]
+        elif (t == "array"): [len(input)]
+        elif (t == "object"): [len(keys(input))]
+        elif (t == "number"): [if (input < 0): 0 - input else: input]
+        else: [0]
+    end
+    elif (name == "utf8bytelength"): [len(input)]
+    elif (name == "keys"): do
+      let t = _jq_type(input)
+      | if (t == "object"): [sort(keys(input))]
+        elif (t == "array"): [map(range(len(input) - 1), fn(i): i;)]
+        else: error("jq: keys requires object or array")
+    end
+    elif (name == "keys_unsorted"): do
+      let t = _jq_type(input)
+      | if (t == "object"): [keys(input)]
+        elif (t == "array"): [map(range(len(input) - 1), fn(i): i;)]
+        else: error("jq: keys_unsorted requires object or array")
+    end
+    elif (name == "values"): do
+      if (is_none(input)): [] else: [input]
+    end
+    elif (name == "has"): do
+      let k = get_arg(0)
+      | let t = _jq_type(input)
+      | if (t == "object"): [!is_none(input[to_string(k)])]
+        elif (t == "array"): [to_number(k) >= 0 && to_number(k) < len(input)]
+        else: error("jq: has requires object or array")
+    end
+    elif (name == "in"): do
+      let container = get_arg(0)
+      | let t = _jq_type(container)
+      | if (t == "object"): [!is_none(container[to_string(input)])]
+        elif (t == "array"): [to_number(input) >= 0 && to_number(input) < len(container)]
+        else: error("jq: in requires object or array")
+    end
+    elif (name == "map"): do
+      let items = _jq_iter_values(input)
+      | let out = fold(items, [], fn(acc, x):
+          acc + _jq_eval(arg_asts[0], x, env)
+        ;)
+      | [out]
+    end
+    elif (name == "map_values"): do
+      let t = _jq_type(input)
+      | if (t == "array"): do
+          let out = fold(input, [], fn(acc, x):
+            let r = _jq_eval(arg_asts[0], x, env)
+            | if (is_empty(r)): acc else: acc + [r[0]]
+          ;)
+          | [out]
+        end
+        elif (t == "object"): do
+          let out = fold(keys(input), dict(), fn(acc, k):
+            let r = _jq_eval(arg_asts[0], input[k], env)
+            | if (is_empty(r)): acc else: set(acc, k, r[0])
+          ;)
+          | [out]
+        end
+        else: error("jq: map_values requires array or object")
+    end
+    elif (name == "select"): do
+      let cond_results = _jq_eval(arg_asts[0], input, env)
+      | if (!is_empty(cond_results) && _jq_truthy(cond_results[0])): [input] else: []
+    end
+    elif (name == "recurse"): do
+      if (arity == 0): _jq_recurse_collect(input)
+      else: do
+        var results = [input]
+        | var queue = [input]
+        | let _ = while (!is_empty(queue)):
+            do
+              let head = queue[0]
+              | let rest = slice(queue, 1, len(queue))
+              | let children = try: _jq_eval(arg_asts[0], head, env) catch: []
+              | results = results + children
+              | queue = rest + children
+              | results
+            end
+          end
+        | results
+      end
+    end
+    elif (name == "recurse_down"): _jq_recurse_collect(input)
+    elif (name == "to_entries"): do
+      let t = _jq_type(input)
+      | if (t == "object"): do
+          let ks = keys(input)
+          | [map(ks, fn(k): {key: k, value: input[k]};)]
+        end
+        elif (t == "array"):
+          [map(range(len(input) - 1), fn(i): {key: i, value: input[i]};)]
+        else: error("jq: to_entries requires object or array")
+    end
+    elif (name == "from_entries"): do
+      let arr = if (_jq_type(input) == "array"): input else: [input]
+      | let result = fold(arr, dict(), fn(acc, entry):
+          let k = if (!is_none(entry["key"])): to_string(entry["key"])
+                  elif (!is_none(entry["name"])): to_string(entry["name"])
+                  else: ""
+          | set(acc, k, entry["value"])
+        ;)
+      | [result]
+    end
+    elif (name == "with_entries"): do
+      let entries_r = _jq_eval_builtin("to_entries", [], input, env)
+      | let entries = if (is_empty(entries_r)): [] else: entries_r[0]
+      | let mapped = fold(entries, [], fn(acc, e):
+          acc + _jq_eval(arg_asts[0], e, env)
+        ;)
+      | _jq_eval_builtin("from_entries", [], mapped, env)
+    end
+    elif (name == "add"): do
+      let t = _jq_type(input)
+      | if (t != "array"): error("jq: add requires array")
+        elif (is_empty(input)): [None]
+        else: [fold(slice(input, 1, len(input)), input[0], fn(a, b): _jq_add_values(a, b);)]
+    end
+    elif (name == "any"): do
+      if (arity == 0):
+        [fold(input, false, fn(acc, x): acc || _jq_truthy(x);)]
+      elif (arity == 1): do
+        let items = _jq_iter_values(input)
+        | [fold(items, false, fn(acc, x):
+            let r = _jq_eval(arg_asts[0], x, env)
+            | acc || (!is_empty(r) && _jq_truthy(r[0]))
+          ;)]
+      end
+      else: do
+        let gen_results = _jq_eval(arg_asts[0], input, env)
+        | [fold(gen_results, false, fn(acc, x):
+            let r = _jq_eval(arg_asts[1], x, env)
+            | acc || (!is_empty(r) && _jq_truthy(r[0]))
+          ;)]
+      end
+    end
+    elif (name == "all"): do
+      if (arity == 0):
+        [fold(input, true, fn(acc, x): acc && _jq_truthy(x);)]
+      elif (arity == 1): do
+        let items = _jq_iter_values(input)
+        | [fold(items, true, fn(acc, x):
+            let r = _jq_eval(arg_asts[0], x, env)
+            | acc && (!is_empty(r) && _jq_truthy(r[0]))
+          ;)]
+      end
+      else: do
+        let gen_results = _jq_eval(arg_asts[0], input, env)
+        | [fold(gen_results, true, fn(acc, x):
+            let r = _jq_eval(arg_asts[1], x, env)
+            | acc && (!is_empty(r) && _jq_truthy(r[0]))
+          ;)]
+      end
+    end
+    elif (name == "flatten"): do
+      if (arity == 0): [flatten(input)]
+      else: do
+        let depth = to_number(get_arg(0))
+        | var arr = input
+        | var i = 0
+        | let _ = while (i < depth): do
+            arr = fold(arr, [], fn(acc, x): if (is_array(x)): acc + x else: acc + [x] ;)
+            | i += 1
+            | arr
+          end end
+        | [arr]
+      end
+    end
+    elif (name == "range"): do
+      if (arity == 1): do
+        let n = to_number(get_arg(0))
+        | map(range(n - 1), fn(i): i;)
+      end
+      elif (arity == 2): do
+        let from_ = to_number(get_arg(0))
+        | let to_ = to_number(get_arg(1))
+        | map(range(to_ - from_ - 1), fn(i): from_ + i;)
+      end
+      else: do
+        let from_ = to_number(get_arg(0))
+        | let to_ = to_number(get_arg(1))
+        | let step_ = to_number(get_arg(2))
+        | var results = []
+        | var i = from_
+        | let _ = while (if (step_ > 0): i < to_ else: i > to_):
+            do results += [i] | i = i + step_ | results end
+          end
+        | results
+      end
+    end
+    elif (name == "floor"): [floor(input)]
+    elif (name == "ceil"): [ceil(input)]
+    elif (name == "round"): [round(input)]
+    elif (name == "sqrt"): [sqrt(input)]
+    elif (name == "pow"): [pow(get_arg(0), get_arg(1))]
+    elif (name == "log" || name == "log2" || name == "log10"): do
+      if (name == "log"): [ln(input)]
+      elif (name == "log2"): [ln(input) / ln(2)]
+      else: [ln(input) / ln(10)]
+    end
+    elif (name == "exp" || name == "exp2" || name == "exp10"): do
+      if (name == "exp"): [exp(input)]
+      elif (name == "exp2"): [pow(2, input)]
+      else: [pow(10, input)]
+    end
+    elif (name == "fabs" || name == "abs"): [if (input < 0): 0 - input else: input]
+    elif (name == "not"): [!_jq_truthy(input)]
+    elif (name == "null"): [None]
+    elif (name == "true"): [true]
+    elif (name == "false"): [false]
+    elif (name == "nan"): [0.0 / 0.0]
+    elif (name == "infinite"): [1.0 / 0.0]
+    elif (name == "isinfinite"): [input > 1e300 || input < -1e300]
+    elif (name == "isnan"): [input != input]
+    elif (name == "isnormal"): [!is_none(input) && input == input && !(input > 1e308 || input < -1e308)]
+    elif (name == "sort"): do
+      if (_jq_type(input) != "array"): error("jq: sort requires array")
+      else: [sort(input)]
+    end
+    elif (name == "sort_by"): do
+      if (_jq_type(input) != "array"): error("jq: sort_by requires array")
+      else: do
+        let keyed = map(input, fn(x):
+          let r = _jq_eval(arg_asts[0], x, env)
+          | [if (is_empty(r)): None else: r[0], x]
+        ;)
+        | [map(sort(keyed), fn(pair): pair[1];)]
+      end
+    end
+    elif (name == "group_by"): do
+      if (_jq_type(input) != "array"): error("jq: group_by requires array")
+      else: do
+        let keyed = map(input, fn(x):
+          let r = _jq_eval(arg_asts[0], x, env)
+          | [if (is_empty(r)): None else: r[0], x]
+        ;)
+        | let sorted = sort(keyed)
+        | var groups = []
+        | var cur_group = []
+        | var cur_key = None
+        | var is_first = true
+        | let _ = map(sorted, fn(pair):
+            let k = pair[0]
+            | let v = pair[1]
+            | if (is_first || _jq_cmp_values(k, cur_key) != 0):
+                do
+                  if (!is_first): groups += [cur_group]
+                  | cur_key = k
+                  | cur_group = [v]
+                  | is_first = false
+                  | groups
+                end
+              else: do cur_group += [v] | cur_group end
+          ;)
+        | if (!is_first): groups += [cur_group]
+        | [groups]
+      end
+    end
+    elif (name == "unique"): do
+      if (_jq_type(input) != "array"): error("jq: unique requires array")
+      else: do
+        let sorted = sort(input)
+        | var result = []
+        | var prev = None
+        | var first = true
+        | let _ = map(sorted, fn(x):
+            if (first || _jq_cmp_values(x, prev) != 0):
+              do result += [x] | prev = x | first = false | result end
+            else: result
+          ;)
+        | [result]
+      end
+    end
+    elif (name == "unique_by"): do
+      if (_jq_type(input) != "array"): error("jq: unique_by requires array")
+      else: do
+        let keyed = map(input, fn(x):
+          let r = _jq_eval(arg_asts[0], x, env)
+          | [if (is_empty(r)): None else: r[0], x]
+        ;)
+        | let sorted = sort(keyed)
+        | var result = []
+        | var prev_key = None
+        | var first = true
+        | let _ = map(sorted, fn(pair):
+            let k = pair[0]
+            | let v = pair[1]
+            | if (first || _jq_cmp_values(k, prev_key) != 0):
+                do result += [v] | prev_key = k | first = false | result end
+              else: result
+          ;)
+        | [result]
+      end
+    end
+    elif (name == "min"): do
+      if (_jq_type(input) != "array"): error("jq: min requires array")
+      elif (is_empty(input)): [None]
+      else: [fold(slice(input, 1, len(input)), input[0], fn(a, b): if (_jq_cmp_values(a, b) <= 0): a else: b;)]
+    end
+    elif (name == "max"): do
+      if (_jq_type(input) != "array"): error("jq: max requires array")
+      elif (is_empty(input)): [None]
+      else: [fold(slice(input, 1, len(input)), input[0], fn(a, b): if (_jq_cmp_values(a, b) >= 0): a else: b;)]
+    end
+    elif (name == "min_by"): do
+      if (_jq_type(input) != "array"): error("jq: min_by requires array")
+      elif (is_empty(input)): [None]
+      else: do
+        let keyed = map(input, fn(x):
+          let r = _jq_eval(arg_asts[0], x, env)
+          | [if (is_empty(r)): None else: r[0], x]
+        ;)
+        | [fold(slice(keyed, 1, len(keyed)), keyed[0], fn(a, b): if (_jq_cmp_values(a[0], b[0]) <= 0): a else: b;)[1]]
+      end
+    end
+    elif (name == "max_by"): do
+      if (_jq_type(input) != "array"): error("jq: max_by requires array")
+      elif (is_empty(input)): [None]
+      else: do
+        let keyed = map(input, fn(x):
+          let r = _jq_eval(arg_asts[0], x, env)
+          | [if (is_empty(r)): None else: r[0], x]
+        ;)
+        | [fold(slice(keyed, 1, len(keyed)), keyed[0], fn(a, b): if (_jq_cmp_values(a[0], b[0]) >= 0): a else: b;)[1]]
+      end
+    end
+    elif (name == "reverse"): [reverse(input)]
+    elif (name == "contains"): do
+      let other = get_arg(0)
+      | let ta = _jq_type(input)
+      | let tb = _jq_type(other)
+      | if (ta == "string" && tb == "string"): [index(input, other) >= 0]
+        elif (ta == "array" && tb == "array"):
+          [fold(other, true, fn(acc, x): acc && contains(input, x);)]
+        elif (ta == "object" && tb == "object"):
+          [fold(keys(other), true, fn(acc, k): acc && !is_none(input[k]);)]
+        else: [_jq_cmp_values(input, other) == 0]
+    end
+    elif (name == "inside"): do
+      let other = get_arg(0)
+      | _jq_eval_builtin("contains", [{type: "literal", value: input}], other, env)
+    end
+    elif (name == "startswith"): [starts_with(input, to_string(get_arg(0)))]
+    elif (name == "endswith"): [ends_with(input, to_string(get_arg(0)))]
+    elif (name == "ltrimstr"): do
+      let s = to_string(get_arg(0))
+      | [if (starts_with(input, s)): slice(input, len(s), len(input)) else: input]
+    end
+    elif (name == "rtrimstr"): do
+      let s = to_string(get_arg(0))
+      | [if (ends_with(input, s)): slice(input, 0, len(input) - len(s)) else: input]
+    end
+    elif (name == "ascii_downcase" || name == "downcase"): [downcase(input)]
+    elif (name == "ascii_upcase" || name == "upcase"): [upcase(input)]
+    elif (name == "ltrim"): [ltrim(input)]
+    elif (name == "rtrim"): [rtrim(input)]
+    elif (name == "explode"): [explode(input)]
+    elif (name == "implode"): [implode(input)]
+    elif (name == "split"): [split(input, to_string(get_arg(0)))]
+    elif (name == "join"): do
+      let sep = to_string(get_arg(0))
+      | let parts = map(input, fn(x): if (is_none(x)): "" else: to_string(x);)
+      | [join(parts, sep)]
+    end
+    elif (name == "test"): do
+      let pat = to_string(get_arg(0))
+      | let flags = if (arity >= 2): to_string(get_arg(1)) else: ""
+      | let full_pat = if (flags != ""): "(?:" + flags + ")" + pat else: pat
+      | [is_regex_match(input, full_pat)]
+    end
+    elif (name == "match"): do
+      let pat = to_string(get_arg(0))
+      | let ms = regex_match(input, pat)
+      | if (is_empty(ms)): []
+        else: do
+          let m = ms[0]
+          | [{offset: index(input, m), length: len(m), string: m, captures: []}]
+        end
+    end
+    elif (name == "capture"): [capture(input, to_string(get_arg(0)))]
+    elif (name == "scan"): scan(input, to_string(get_arg(0)))
+    elif (name == "sub"): do
+      let pat = to_string(get_arg(0))
+      | let rep = to_string(get_arg(1))
+      | [replace(input, pat, rep)]
+    end
+    elif (name == "gsub"): do
+      let pat = to_string(get_arg(0))
+      | let rep = to_string(get_arg(1))
+      | [gsub(input, pat, rep)]
+    end
+    elif (name == "tostring"): do
+      if (_jq_type(input) == "string"): [input] else: [to_string(input)]
+    end
+    elif (name == "tonumber"): [to_number(input)]
+    elif (name == "tojson"): [to_string(input)]
+    elif (name == "fromjson"): do
+      let t = trim(to_string(input))
+      | if (t == "null"): [None]
+        elif (t == "true"): [true]
+        elif (t == "false"): [false]
+        elif (is_regex_match(t, "^-?[0-9]")): [to_number(t)]
+        else: [t]
+    end
+    elif (name == "index"): do
+      let needle = get_arg(0)
+      | let t = _jq_type(input)
+      | if (t == "string"): [index(input, to_string(needle))]
+        elif (t == "array"): do
+          var found = -1
+          | let _ = map(range(len(input) - 1), fn(i):
+              if (found < 0 && _jq_cmp_values(input[i], needle) == 0):
+                do found = i | found end
+              else: found
+            ;)
+          | [found]
+        end
+        else: [None]
+    end
+    elif (name == "rindex"): do
+      let needle = get_arg(0)
+      | let t = _jq_type(input)
+      | if (t == "string"): [rindex(input, to_string(needle))]
+        elif (t == "array"): do
+          var found = -1
+          | let _ = map(range(len(input) - 1), fn(i):
+              if (_jq_cmp_values(input[i], needle) == 0): do found = i | found end
+              else: found
+            ;)
+          | [found]
+        end
+        else: [None]
+    end
+    elif (name == "indices"): do
+      let needle = get_arg(0)
+      | let t = _jq_type(input)
+      | if (t == "string"): do
+          let ns = to_string(needle)
+          | let nl = len(ns)
+          | var idxs = []
+          | var start = 0
+          | let _ = while (start <= len(input)):
+              do
+                let i = index(slice(input, start, len(input)), ns)
+                | if (i < 0): do start = len(input) + 1 | idxs end
+                  else: do idxs += [start + i] | start = start + i + nl | idxs end
+              end
+            end
+          | [idxs]
+        end
+        elif (t == "array"): do
+          let needle_arr = if (_jq_type(needle) == "array"): needle else: [needle]
+          | let nl = len(needle_arr)
+          | var idxs = []
+          | let _ = map(range(len(input) - nl), fn(i):
+              let sub = slice(input, i, i + nl)
+              | if (_jq_cmp_values(sub, needle_arr) == 0): do idxs += [i] | idxs end
+                else: idxs
+            ;)
+          | [idxs]
+        end
+        else: [[]]
+    end
+    elif (name == "getpath"): [_jq_get_at_path(input, get_arg(0))]
+    elif (name == "setpath"): [_jq_set_at_path(input, get_arg(0), get_arg(1))]
+    elif (name == "delpaths"): do
+      let paths = get_arg(0)
+      | [fold(paths, input, fn(acc, p): _jq_del_at_path(acc, p);)]
+    end
+    elif (name == "paths"): do
+      let t = _jq_type(input)
+      | if (t == "array"): do
+          let nested = fold(range(len(input) - 1), [], fn(acc, i):
+            let sub_r = _jq_eval_builtin("paths", [], input[i], env)
+            | let sub_paths = if (is_empty(sub_r) || is_empty(sub_r[0])): []
+                              else: map(sub_r[0], fn(p): [i] + p;)
+            | acc + [[i]] + sub_paths
+          ;)
+          | [nested]
+        end
+        elif (t == "object"): do
+          let ks = keys(input)
+          | let nested = fold(ks, [], fn(acc, k):
+              let sub_r = _jq_eval_builtin("paths", [], input[k], env)
+              | let sub_paths = if (is_empty(sub_r) || is_empty(sub_r[0])): []
+                                else: map(sub_r[0], fn(p): [k] + p;)
+              | acc + [[k]] + sub_paths
+            ;)
+          | [nested]
+        end
+        else: [[]]
+    end
+    elif (name == "leaf_paths"): do
+      let all_r = _jq_eval_builtin("paths", [], input, env)
+      | let all_paths = if (is_empty(all_r)): [] else: all_r[0]
+      | let leaf = fold(all_paths, [], fn(acc, p):
+          let v = _jq_get_at_path(input, p)
+          | let tv = _jq_type(v)
+          | if (tv != "array" && tv != "object"): acc + [p] else: acc
+        ;)
+      | [leaf]
+    end
+    elif (name == "path"): [[]]
+    elif (name == "first"): do
+      if (arity == 0): do
+        let t = _jq_type(input)
+        | if (t == "array"): if (is_empty(input)): [None] else: [input[0]]
+          else: error("jq: first requires array")
+      end
+      else: do
+        let results = _jq_eval(arg_asts[0], input, env)
+        | if (is_empty(results)): [] else: [results[0]]
+      end
+    end
+    elif (name == "last"): do
+      if (arity == 0): do
+        let t = _jq_type(input)
+        | if (t == "array"):
+            if (is_empty(input)): [None] else: [input[len(input) - 1]]
+          else: error("jq: last requires array")
+      end
+      else: do
+        let results = _jq_eval(arg_asts[0], input, env)
+        | if (is_empty(results)): [] else: [results[len(results) - 1]]
+      end
+    end
+    elif (name == "nth"): do
+      let n = to_number(get_arg(0))
+      | let results = _jq_eval(arg_asts[1], input, env)
+      | if (n >= len(results)): [] else: [results[to_number(n)]]
+    end
+    elif (name == "limit"): do
+      let n = to_number(get_arg(0))
+      | let results = _jq_eval(arg_asts[1], input, env)
+      | let end_i = if (n > len(results)): len(results) else: to_number(n)
+      | slice(results, 0, end_i)
+    end
+    elif (name == "until"): do
+      var state = input
+      | let _ = while (!_jq_truthy(first(_jq_eval(arg_asts[0], state, env)))):
+          do
+            let r = _jq_eval(arg_asts[1], state, env)
+            | state = if (is_empty(r)): state else: r[0]
+            | state
+          end
+        end
+      | [state]
+    end
+    elif (name == "while"): do
+      var state = input
+      | var results = []
+      | let _ = while (_jq_truthy(first(_jq_eval(arg_asts[0], state, env)))): do
+          results += [state]
+          | let r = _jq_eval(arg_asts[1], state, env)
+          | state = if (is_empty(r)): state else: r[0]
+          | results
+        end end
+      | results
+    end
+    elif (name == "numbers"): if (_jq_type(input) == "number"): [input] else: []
+    elif (name == "strings"): if (_jq_type(input) == "string"): [input] else: []
+    elif (name == "booleans"): if (_jq_type(input) == "boolean"): [input] else: []
+    elif (name == "nulls"): if (is_none(input)): [input] else: []
+    elif (name == "arrays"): if (_jq_type(input) == "array"): [input] else: []
+    elif (name == "objects"): if (_jq_type(input) == "object"): [input] else: []
+    elif (name == "iterables"): do
+      let t = _jq_type(input)
+      | if (t == "array" || t == "object"): [input] else: []
+    end
+    elif (name == "scalars"): do
+      let t = _jq_type(input)
+      | if (t != "array" && t != "object"): [input] else: []
+    end
+    elif (name == "format"): [_jq_format_apply(to_string(get_arg(0)), input)]
+    elif (name == "env"): [dict()]
+    elif (name == "debug"): [input]
+    elif (name == "input" || name == "inputs"): []
+    elif (name == "builtins"): [["empty", "error", "type", "length", "keys", "values",
+      "has", "in", "map", "map_values", "select", "recurse", "to_entries", "from_entries",
+      "with_entries", "add", "any", "all", "flatten", "range", "floor", "ceil", "round",
+      "sqrt", "fabs", "abs", "not", "sort", "sort_by", "group_by", "unique", "unique_by",
+      "min", "max", "min_by", "max_by", "reverse", "contains", "inside", "startswith",
+      "endswith", "ltrimstr", "rtrimstr", "ascii_downcase", "ascii_upcase", "explode",
+      "implode", "split", "join", "test", "match", "capture", "scan", "sub", "gsub",
+      "tostring", "tonumber", "tojson", "fromjson", "index", "rindex", "indices",
+      "getpath", "setpath", "delpaths", "paths", "leaf_paths", "first", "last",
+      "nth", "limit", "until", "while", "numbers", "strings", "booleans", "nulls",
+      "arrays", "objects", "iterables", "scalars", "debug"]]
+    else: do
+      let fn_def = _jq_env_get_fn(env, name, arity)
+      | if (is_none(fn_def)): error("jq: unknown function: " + name + "/" + to_string(arity))
+        else: _jq_eval_user_fn(fn_def, arg_asts, input, env)
+    end
+end
+
+def _jq_eval(ast, input, env):
+  let node_type = ast["type"]
+  | if (node_type == "literal"): [ast["value"]]
+    elif (node_type == "identity"): [input]
+    elif (node_type == "field"): do
+      let base = if (is_none(ast["base"])): input
+                 else: do
+                   let r = _jq_eval(ast["base"], input, env)
+                   | if (is_empty(r)): None else: r[0]
+                 end
+      | let t = _jq_type(base)
+      | if (t == "object"): [base[ast["name"]]]
+        elif (t == "null"): [None]
+        else: error("jq: cannot index " + t + " with string \"" + ast["name"] + "\"")
+    end
+    elif (node_type == "field_opt"): do
+      let base = if (is_none(ast["base"])): input
+                 else: do
+                   let r = _jq_eval(ast["base"], input, env)
+                   | if (is_empty(r)): None else: r[0]
+                 end
+      | let t = _jq_type(base)
+      | if (t == "object"): [base[ast["name"]]]
+        elif (t == "null"): [None]
+        else: []
+    end
+    elif (node_type == "pipe"): do
+      let lefts = _jq_eval(ast["left"], input, env)
+      | fold(lefts, [], fn(acc, v): acc + _jq_eval(ast["right"], v, env);)
+    end
+    elif (node_type == "comma_op"):
+      _jq_eval(ast["left"], input, env) + _jq_eval(ast["right"], input, env)
+    elif (node_type == "index"): do
+      let base = if (is_none(ast["base"])): input
+                 else: do
+                   let r = _jq_eval(ast["base"], input, env)
+                   | if (is_empty(r)): None else: r[0]
+                 end
+      | let idx_results = _jq_eval(ast["idx"], input, env)
+      | let idx = if (is_empty(idx_results)): None else: idx_results[0]
+      | [_jq_get_index(base, idx)]
+    end
+    elif (node_type == "iter_all"): do
+      let base = if (is_none(ast["base"])): input
+                 else: do
+                   let r = _jq_eval(ast["base"], input, env)
+                   | if (is_empty(r)): None else: r[0]
+                 end
+      | _jq_iter_values(base)
+    end
+    elif (node_type == "slice"): do
+      let base = if (is_none(ast["base"])): input
+                 else: do
+                   let r = _jq_eval(ast["base"], input, env)
+                   | if (is_empty(r)): None else: r[0]
+                 end
+      | let from_v = if (is_none(ast["from"])): None
+                     else: do
+                       let r = _jq_eval(ast["from"], input, env)
+                       | if (is_empty(r)): None else: r[0]
+                     end
+      | let to_v = if (is_none(ast["to"])): None
+                   else: do
+                     let r = _jq_eval(ast["to"], input, env)
+                     | if (is_empty(r)): None else: r[0]
+                   end
+      | [_jq_get_slice(base, from_v, to_v)]
+    end
+    elif (node_type == "recurse_all"): _jq_recurse_collect(input)
+    elif (node_type == "optional_expr"):
+      try: _jq_eval(ast["inner"], input, env) catch: []
+    elif (node_type == "not_expr"): [!_jq_truthy(input)]
+    elif (node_type == "neg"): do
+      let r = _jq_eval(ast["inner"], input, env)
+      | let v = if (is_empty(r)): None else: r[0]
+      | if (_jq_type(v) == "number"): [0 - v]
+        else: error("jq: cannot negate " + _jq_type(v))
+    end
+    elif (node_type == "binop"): do
+      let op = ast["op"]
+      | let l_results = _jq_eval(ast["left"], input, env)
+      | let lv = if (is_empty(l_results)): None else: l_results[0]
+      | if (op == "and"):
+          if (!_jq_truthy(lv)): [false]
+          else: do
+            let r_results = _jq_eval(ast["right"], input, env)
+            | let rv = if (is_empty(r_results)): None else: r_results[0]
+            | [_jq_truthy(rv)]
+          end
+        elif (op == "or"):
+          if (_jq_truthy(lv)): [true]
+          else: do
+            let r_results = _jq_eval(ast["right"], input, env)
+            | let rv = if (is_empty(r_results)): None else: r_results[0]
+            | [_jq_truthy(rv)]
+          end
+        else: do
+          let r_results = _jq_eval(ast["right"], input, env)
+          | let rv = if (is_empty(r_results)): None else: r_results[0]
+          | if (op == "+"): [_jq_add_values(lv, rv)]
+            elif (op == "-"): [_jq_sub_values(lv, rv)]
+            elif (op == "*"): [_jq_mul_values(lv, rv)]
+            elif (op == "/"): [_jq_div_values(lv, rv)]
+            elif (op == "%"): [lv - floor(lv / rv) * rv]
+            elif (op == "=="): [_jq_cmp_values(lv, rv) == 0]
+            elif (op == "!="): [_jq_cmp_values(lv, rv) != 0]
+            elif (op == "<"): [_jq_cmp_values(lv, rv) < 0]
+            elif (op == "<="): [_jq_cmp_values(lv, rv) <= 0]
+            elif (op == ">"): [_jq_cmp_values(lv, rv) > 0]
+            elif (op == ">="): [_jq_cmp_values(lv, rv) >= 0]
+            else: error("jq: unknown operator: " + op)
+        end
+    end
+    elif (node_type == "alt_op"): do
+      let l_results = _jq_eval(ast["left"], input, env)
+      | let valid = fold(l_results, [], fn(acc, v): if (_jq_truthy(v)): acc + [v] else: acc;)
+      | if (!is_empty(valid)): valid
+        else: _jq_eval(ast["right"], input, env)
+    end
+    elif (node_type == "try_catch"): do
+      let results = try: _jq_eval(ast["expr"], input, env) catch: None
+      | if (is_none(results)):
+          if (is_none(ast["handler"])): []
+          else: _jq_eval(ast["handler"], "", env)
+        else: results
+    end
+    elif (node_type == "if"): do
+      let branches = ast["branches"]
+      | var chosen = None
+      | var i = 0
+      | let _ = while (i < len(branches) && is_none(chosen)):
+          do
+            let branch = branches[i]
+            | let cond_results = _jq_eval(branch["cond"], input, env)
+            | let cond_val = !is_empty(cond_results) && _jq_truthy(cond_results[0])
+            | if (cond_val): do chosen = branch["then"] | i += 1 | chosen end
+              else: do i += 1 | i end
+          end
+        end
+      | if (!is_none(chosen)): _jq_eval(chosen, input, env)
+        else: _jq_eval(ast["else_expr"], input, env)
+    end
+    elif (node_type == "binding"): do
+      let gen_results = _jq_eval(ast["expr"], input, env)
+      | fold(gen_results, [], fn(acc, v):
+          let new_env = _jq_env_set_var(env, ast["var"], v)
+          | acc + _jq_eval(ast["body"], input, new_env)
+        ;)
+    end
+    elif (node_type == "var_ref"): do
+      let v = _jq_env_get_var(env, ast["name"])
+      | if (is_none(v)): error("jq: undefined variable $" + ast["name"])
+        else: [v]
+    end
+    elif (node_type == "array"): do
+      let items = _jq_eval(ast["expr"], input, env)
+      | [items]
+    end
+    elif (node_type == "object"): [_jq_eval_fields(ast["fields"], input, env)]
+    elif (node_type == "interp_str"): [_jq_eval_str_parts(ast["parts"], input, env)]
+    elif (node_type == "fmt_apply"): [_jq_format_apply(ast["fmt"], input)]
+    elif (node_type == "fmt_str"): do
+      let r = _jq_eval(ast["inner"], input, env)
+      | let s = if (is_empty(r)): "" else: r[0]
+      | [_jq_format_apply(ast["fmt"], s)]
+    end
+    elif (node_type == "reduce"): do
+      let gen_results = _jq_eval(ast["gen"], input, env)
+      | let init_results = _jq_eval(ast["init"], input, env)
+      | var acc = if (is_empty(init_results)): None else: init_results[0]
+      | let _ = map(gen_results, fn(v):
+          let new_env = _jq_env_set_var(env, ast["var"], v)
+          | let r = _jq_eval(ast["body"], acc, new_env)
+          | acc = if (is_empty(r)): acc else: r[0]
+          | acc
+        ;)
+      | [acc]
+    end
+    elif (node_type == "foreach"): do
+      let gen_results = _jq_eval(ast["gen"], input, env)
+      | let init_results = _jq_eval(ast["init"], input, env)
+      | var state = if (is_empty(init_results)): None else: init_results[0]
+      | var results = []
+      | let _ = map(gen_results, fn(v):
+          let new_env = _jq_env_set_var(env, ast["var"], v)
+          | let r = _jq_eval(ast["update"], state, new_env)
+          | state = if (is_empty(r)): state else: r[0]
+          | if (is_none(ast["extract"])): do results += [state] | results end
+            else: do
+              let er = _jq_eval(ast["extract"], state, new_env)
+              | results = results + er
+              | results
+            end
+        ;)
+      | results
+    end
+    elif (node_type == "label_break"):
+      try: _jq_eval(ast["body"], input, env) catch: []
+    elif (node_type == "break_out"): error("$__loc__: break " + ast["label"])
+    elif (node_type == "def_fn"): do
+      let new_env = _jq_env_add_fn(env, ast["name"], len(ast["params"]), ast["params"], ast["body"])
+      | _jq_eval(ast["next"], input, new_env)
+    end
+    elif (node_type == "call"): do
+      let fn_def = _jq_env_get_fn(env, ast["name"], len(ast["args"]))
+      | if (!is_none(fn_def)): _jq_eval_user_fn(fn_def, ast["args"], input, env)
+        else: _jq_eval_builtin(ast["name"], ast["args"], input, env)
+    end
+    else: error("jq: unknown AST node type: " + node_type)
+end
+
+# ===== Public API =====
+
+def jq_compile(program):
+  _jq_parse(program)
+end
+
+def jq_eval(ast, input):
+  _jq_eval(ast, input, _jq_env_new())
+end
+
+def jq_run(program, input):
+  let ast = _jq_parse(program)
+  | _jq_eval(ast, input, _jq_env_new())
+end
+
+def jq_run_first(program, input):
+  let results = jq_run(program, input)
+  | if (is_empty(results)): None else: results[0]
+end
