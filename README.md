@@ -79,9 +79,9 @@ Evaluates a pre-compiled AST against the given input.
 | Types | `type`, `arrays`, `objects`, `strings`, `numbers`, `booleans`, `nulls`, `iterables`, `scalars` |
 | Length | `length`, `utf8bytelength` |
 | Keys/Values | `keys`, `values`, `has`, `in`, `to_entries`, `from_entries`, `with_entries` |
-| Collections | `map`, `map_values`, `select`, `empty`, `add`, `flatten`, `range`, `sort`, `sort_by`, `group_by`, `unique`, `unique_by`, `min`, `max`, `min_by`, `max_by`, `reverse`, `contains`, `inside`, `indices`, `index`, `rindex` |
-| Math | `floor`, `ceil`, `round`, `sqrt`, `fabs`, `abs`, `nan`, `infinite`, `isinfinite`, `isnan`, `isnormal`, `isfinite` |
-| Strings | `split`, `join`, `ltrimstr`, `rtrimstr`, `startswith`, `endswith`, `ascii_downcase`, `ascii_upcase`, `explode`, `implode`, `tostring`, `tonumber`, `tojson`, `fromjson`, `test`, `match`, `capture`, `scan`, `sub`, `gsub` |
+| Collections | `map`, `map_values`, `select`, `empty`, `add`, `flatten`, `transpose`, `walk`, `del`, `range`, `sort`, `sort_by`, `group_by`, `unique`, `unique_by`, `min`, `max`, `min_by`, `max_by`, `reverse`, `contains`, `inside`, `indices`, `index`, `rindex` |
+| Math | `floor`, `ceil`, `round`, `sqrt`, `fabs`, `abs`, `nan`, `infinite`, `isinfinite`, `isnan`, `isnormal`, `isfinite`, `finites`, `normals` |
+| Strings | `split`, `join`, `ltrimstr`, `rtrimstr`, `ltrim`, `rtrim`, `trim`, `trimstr`, `startswith`, `endswith`, `ascii_downcase`, `ascii_upcase`, `explode`, `implode`, `tostring`, `tonumber`, `tojson`, `fromjson`, `test`, `match`, `capture`, `scan`, `sub`, `gsub` |
 | Paths | `paths`, `leaf_paths`, `getpath`, `setpath`, `delpaths` |
 | Iteration | `any`, `all`, `recurse`, `first`, `last`, `nth`, `limit`, `until`, `while` |
 | Misc | `error`, `debug`, `env`, `builtins` |

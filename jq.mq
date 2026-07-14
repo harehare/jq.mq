@@ -586,11 +586,11 @@ def _jq_parse_pipe(tokens, pos):
       if (_jq_tt(tokens, pos1 + 1) != "var"): error("jq: expected $var after 'as'")
       | let var_name = _jq_tv(tokens, pos1 + 1)
       | let pos2 = _jq_expect(tokens, pos1 + 2, "pipe")
-      | let r2 = _jq_parse_pipe(tokens, pos2)
+      | let r2 = _jq_parse_program(tokens, pos2)
       | [{type: "binding", expr: left, "var": var_name, body: r2[0]}, r2[1]]
     end
     elif (_jq_tt(tokens, pos1) == "pipe"): do
-      let r2 = _jq_parse_pipe(tokens, pos1 + 1)
+      let r2 = _jq_parse_program(tokens, pos1 + 1)
       | [{type: "pipe", left: left, right: r2[0]}, r2[1]]
     end
     else: [left, pos1]
@@ -604,8 +604,10 @@ def _jq_parse_def(tokens, pos):
       | var cur = pos + 2
       | let _ = while (_jq_tt(tokens, cur) != "rparen" && _jq_tt(tokens, cur) != "eof"):
           do
-            if (_jq_tt(tokens, cur) == "ident" || _jq_tt(tokens, cur) == "var"):
+            if (_jq_tt(tokens, cur) == "ident"):
               do plist += [_jq_tv(tokens, cur)] | cur += 1 | plist end
+            elif (_jq_tt(tokens, cur) == "var"):
+              do plist += ["$" + _jq_tv(tokens, cur)] | cur += 1 | plist end
             | if (_jq_tt(tokens, cur) == "semi"):
                 do cur += 1 | plist end
               else: plist
@@ -846,17 +848,21 @@ def _jq_set_at_path(v, path, val):
     | let tv = _jq_type(v)
     | if (tv == "null" || tv == "object"): do
         let cur = if (is_none(v)): dict() else: v
-        | let sub = _jq_get_index(cur, h)
-        | let new_sub = _jq_set_at_path(sub, rest, val)
+        | let child = _jq_get_index(cur, h)
+        | let new_sub = _jq_set_at_path(child, rest, val)
         | set(cur, to_string(h), new_sub)
       end
       elif (tv == "array"): do
         let idx = to_number(h)
         | let n = len(v)
         | let real_idx = if (idx < 0): n + idx else: idx
-        | let sub = if (real_idx >= 0 && real_idx < n): v[real_idx] else: None
-        | let new_sub = _jq_set_at_path(sub, rest, val)
-        | update(v, real_idx, new_sub)
+        | if (real_idx < 0): error("jq: array index out of range")
+          else: do
+            let child = if (real_idx < n): v[real_idx] else: None
+            | let new_sub = _jq_set_at_path(child, rest, val)
+            | let padding = map(range(real_idx - n - 1), fn(_): None;)
+            | slice(v, 0, real_idx) + padding + [new_sub] + slice(v, real_idx + 1, n)
+          end
       end
       else: error("jq: cannot set path in " + tv)
   end
@@ -871,26 +877,71 @@ def _jq_del_at_path(v, path):
     | if (tv == "object"): do
         if (is_empty(rest)): del(v, to_string(h))
         else: do
-          let sub = v[to_string(h)]
-          | set(v, to_string(h), _jq_del_at_path(sub, rest))
+          let child = v[to_string(h)]
+          | set(v, to_string(h), _jq_del_at_path(child, rest))
         end
       end
       elif (tv == "array"): do
         let idx = to_number(h)
         | let n = len(v)
         | let real_idx = if (idx < 0): n + idx else: idx
-        | if (is_empty(rest)): do
+        | if (real_idx < 0 || real_idx >= n): v
+          elif (is_empty(rest)): do
             let front = slice(v, 0, real_idx)
             | let back = slice(v, real_idx + 1, n)
             | front + back
           end
           else: do
-            let sub = v[real_idx]
-            | update(v, real_idx, _jq_del_at_path(sub, rest))
+          let child = v[real_idx]
+            | update(v, real_idx, _jq_del_at_path(child, rest))
           end
       end
       else: v
   end
+end
+
+# Converts a selector AST used by del() into a jq path. Keeping this separate
+# from evaluation prevents del(.a) from reading .a before deleting it.
+def _jq_path_from_ast(ast, input, env):
+  let node_type = ast["type"]
+  | if (node_type == "identity"): []
+    elif (node_type == "optional_expr"):
+      _jq_path_from_ast(ast["inner"], input, env)
+    elif (node_type == "field" || node_type == "field_opt"): do
+      let prefix = if (is_none(ast["base"])): []
+                   else: _jq_path_from_ast(ast["base"], input, env)
+      | prefix + [ast["name"]]
+    end
+    elif (node_type == "index"): do
+      let prefix = if (is_none(ast["base"])): []
+                   else: _jq_path_from_ast(ast["base"], input, env)
+      | let values = _jq_eval(ast["idx"], input, env)
+      | if (is_empty(values)): error("jq: empty index in del")
+        else: prefix + [values[0]]
+    end
+    else: error("jq: del requires a selector")
+end
+
+def _jq_paths_from_ast(ast, input, env):
+  if (ast["type"] == "comma_op"):
+    _jq_paths_from_ast(ast["left"], input, env) + _jq_paths_from_ast(ast["right"], input, env)
+  else: [_jq_path_from_ast(ast, input, env)]
+end
+
+def _jq_walk(filter_ast, input, env):
+  let t = _jq_type(input)
+  | let descended = if (t == "array"):
+      map(input, fn(value):
+        let results = _jq_walk(filter_ast, value, env)
+        | if (is_empty(results)): None else: results[0]
+      ;)
+    elif (t == "object"):
+      fold(keys(input), dict(), fn(acc, key):
+        let results = _jq_walk(filter_ast, input[key], env)
+        | set(acc, key, if (is_empty(results)): None else: results[0])
+      ;)
+    else: input
+  | _jq_eval(filter_ast, descended, env)
 end
 
 # ===== Evaluator =====
@@ -932,11 +983,22 @@ def _jq_eval_user_fn(fn_def, arg_asts, input, env):
   | let body = fn_def["body"]
   | var new_env = env
   | let _ = map(range(len(params) - 1), fn(i):
-      let pname = params[i]
+      let pname_raw = params[i]
+      | let is_var = starts_with(pname_raw, "$")
+      | let pname = if (is_var): slice(pname_raw, 1, len(pname_raw)) else: pname_raw
       | let arg_ast = if (i < len(arg_asts)): arg_asts[i]
                       else: {type: "literal", value: None}
-      | new_env = _jq_env_add_fn(new_env, pname, 0, [], arg_ast)
-      | new_env
+      | if (is_var):
+          do
+            let val = _jq_eval(arg_ast, input, env)
+            | new_env = _jq_env_set_var(new_env, pname, if (is_empty(val)): None else: val[0])
+            | new_env
+          end
+        else:
+          do
+            new_env = _jq_env_add_fn(new_env, pname, 0, [], arg_ast)
+            | new_env
+          end
     ;)
   | _jq_eval(body, input, new_env)
 end
@@ -1124,6 +1186,24 @@ def _jq_eval_builtin(name, arg_asts, input, env):
         | [arr]
       end
     end
+    elif (name == "transpose"): do
+      if (_jq_type(input) != "array"): error("jq: transpose requires array")
+      else: do
+        let width = fold(input, 0, fn(max_width, row):
+          if (_jq_type(row) == "array" && len(row) > max_width): len(row) else: max_width
+        ;)
+        | [map(range(width - 1), fn(column):
+            map(input, fn(row):
+              if (_jq_type(row) == "array" && column < len(row)): row[column] else: None
+            ;)
+          ;)]
+      end
+    end
+    elif (name == "walk"): _jq_walk(arg_asts[0], input, env)
+    elif (name == "del"): do
+      let paths = _jq_paths_from_ast(arg_asts[0], input, env)
+      | [fold(paths, input, fn(acc, path): _jq_del_at_path(acc, path);)]
+    end
     elif (name == "range"): do
       if (arity == 1): do
         let n = to_number(get_arg(0))
@@ -1170,7 +1250,12 @@ def _jq_eval_builtin(name, arg_asts, input, env):
     elif (name == "infinite"): [1.0 / 0.0]
     elif (name == "isinfinite"): [input > 1e300 || input < -1e300]
     elif (name == "isnan"): [input != input]
-    elif (name == "isnormal"): [!is_none(input) && input == input && !(input > 1e308 || input < -1e308)]
+    elif (name == "isfinite"): [input == input && !(input > 1e300 || input < -1e300)]
+    elif (name == "isnormal"): [input != 0 && input == input && !(input > 1e300 || input < -1e300)]
+    elif (name == "finites"):
+      if (input == input && !(input > 1e300 || input < -1e300)): [input] else: []
+    elif (name == "normals"):
+      if (input != 0 && input == input && !(input > 1e300 || input < -1e300)): [input] else: []
     elif (name == "sort"): do
       if (_jq_type(input) != "array"): error("jq: sort requires array")
       else: [sort(input)]
@@ -1312,6 +1397,12 @@ def _jq_eval_builtin(name, arg_asts, input, env):
     elif (name == "ascii_upcase" || name == "upcase"): [upcase(input)]
     elif (name == "ltrim"): [ltrim(input)]
     elif (name == "rtrim"): [rtrim(input)]
+    elif (name == "trim"): [trim(input)]
+    elif (name == "trimstr"): do
+      let s = to_string(get_arg(0))
+      | let without_prefix = if (starts_with(input, s)): slice(input, len(s), len(input)) else: input
+      | [if (ends_with(without_prefix, s)): slice(without_prefix, 0, len(without_prefix) - len(s)) else: without_prefix]
+    end
     elif (name == "explode"): [explode(input)]
     elif (name == "implode"): [implode(input)]
     elif (name == "split"): [split(input, to_string(get_arg(0)))]
@@ -1536,13 +1627,13 @@ def _jq_eval_builtin(name, arg_asts, input, env):
     elif (name == "builtins"): [["empty", "error", "type", "length", "keys", "values",
       "has", "in", "map", "map_values", "select", "recurse", "to_entries", "from_entries",
       "with_entries", "add", "any", "all", "flatten", "range", "floor", "ceil", "round",
-      "sqrt", "fabs", "abs", "not", "sort", "sort_by", "group_by", "unique", "unique_by",
+      "transpose", "walk", "del", "sqrt", "fabs", "abs", "not", "sort", "sort_by", "group_by", "unique", "unique_by",
       "min", "max", "min_by", "max_by", "reverse", "contains", "inside", "startswith",
-      "endswith", "ltrimstr", "rtrimstr", "ascii_downcase", "ascii_upcase", "explode",
+      "endswith", "ltrimstr", "rtrimstr", "ltrim", "rtrim", "trim", "trimstr", "ascii_downcase", "ascii_upcase", "explode",
       "implode", "split", "join", "test", "match", "capture", "scan", "sub", "gsub",
       "tostring", "tonumber", "tojson", "fromjson", "index", "rindex", "indices",
       "getpath", "setpath", "delpaths", "paths", "leaf_paths", "first", "last",
-      "nth", "limit", "until", "while", "numbers", "strings", "booleans", "nulls",
+      "nth", "limit", "until", "while", "isfinite", "finites", "normals", "numbers", "strings", "booleans", "nulls",
       "arrays", "objects", "iterables", "scalars", "debug"]]
     else: do
       let fn_def = _jq_env_get_fn(env, name, arity)
@@ -1556,26 +1647,40 @@ def _jq_eval(ast, input, env):
   | if (node_type == "literal"): [ast["value"]]
     elif (node_type == "identity"): [input]
     elif (node_type == "field"): do
-      let base = if (is_none(ast["base"])): input
-                 else: do
-                   let r = _jq_eval(ast["base"], input, env)
-                   | if (is_empty(r)): None else: r[0]
-                 end
-      | let t = _jq_type(base)
-      | if (t == "object"): [base[ast["name"]]]
-        elif (t == "null"): [None]
-        else: error("jq: cannot index " + t + " with string \"" + ast["name"] + "\"")
+      let name = ast["name"]
+      | if (is_none(ast["base"])): do
+          let t = _jq_type(input)
+          | if (t == "object"): [input[name]]
+            elif (t == "null"): [None]
+            else: error("jq: cannot index " + t + " with string \"" + name + "\"")
+        end
+        else: do
+          let bases = _jq_eval(ast["base"], input, env)
+          | fold(bases, [], fn(acc, base):
+              let t = _jq_type(base)
+              | acc + if (t == "object"): [base[name]]
+                      elif (t == "null"): [None]
+                      else: error("jq: cannot index " + t + " with string \"" + name + "\"")
+            ;)
+        end
     end
     elif (node_type == "field_opt"): do
-      let base = if (is_none(ast["base"])): input
-                 else: do
-                   let r = _jq_eval(ast["base"], input, env)
-                   | if (is_empty(r)): None else: r[0]
-                 end
-      | let t = _jq_type(base)
-      | if (t == "object"): [base[ast["name"]]]
-        elif (t == "null"): [None]
-        else: []
+      let name = ast["name"]
+      | if (is_none(ast["base"])): do
+          let t = _jq_type(input)
+          | if (t == "object"): [input[name]]
+            elif (t == "null"): [None]
+            else: []
+        end
+        else: do
+          let bases = _jq_eval(ast["base"], input, env)
+          | fold(bases, [], fn(acc, base):
+              let t = _jq_type(base)
+              | acc + if (t == "object"): [base[name]]
+                      elif (t == "null"): [None]
+                      else: []
+            ;)
+        end
     end
     elif (node_type == "pipe"): do
       let lefts = _jq_eval(ast["left"], input, env)
@@ -1584,40 +1689,37 @@ def _jq_eval(ast, input, env):
     elif (node_type == "comma_op"):
       _jq_eval(ast["left"], input, env) + _jq_eval(ast["right"], input, env)
     elif (node_type == "index"): do
-      let base = if (is_none(ast["base"])): input
-                 else: do
-                   let r = _jq_eval(ast["base"], input, env)
-                   | if (is_empty(r)): None else: r[0]
-                 end
-      | let idx_results = _jq_eval(ast["idx"], input, env)
+      let idx_results = _jq_eval(ast["idx"], input, env)
       | let idx = if (is_empty(idx_results)): None else: idx_results[0]
-      | [_jq_get_index(base, idx)]
+      | if (is_none(ast["base"])): [_jq_get_index(input, idx)]
+        else: do
+          let bases = _jq_eval(ast["base"], input, env)
+          | fold(bases, [], fn(acc, base): acc + [_jq_get_index(base, idx)];)
+        end
     end
     elif (node_type == "iter_all"): do
-      let base = if (is_none(ast["base"])): input
-                 else: do
-                   let r = _jq_eval(ast["base"], input, env)
-                   | if (is_empty(r)): None else: r[0]
-                 end
-      | _jq_iter_values(base)
+      if (is_none(ast["base"])): _jq_iter_values(input)
+      else: do
+        let bases = _jq_eval(ast["base"], input, env)
+        | fold(bases, [], fn(acc, base): acc + _jq_iter_values(base);)
+      end
     end
     elif (node_type == "slice"): do
-      let base = if (is_none(ast["base"])): input
-                 else: do
-                   let r = _jq_eval(ast["base"], input, env)
-                   | if (is_empty(r)): None else: r[0]
-                 end
-      | let from_v = if (is_none(ast["from"])): None
-                     else: do
-                       let r = _jq_eval(ast["from"], input, env)
-                       | if (is_empty(r)): None else: r[0]
-                     end
+      let from_v = if (is_none(ast["from"])): None
+                   else: do
+                     let r = _jq_eval(ast["from"], input, env)
+                     | if (is_empty(r)): None else: r[0]
+                   end
       | let to_v = if (is_none(ast["to"])): None
                    else: do
                      let r = _jq_eval(ast["to"], input, env)
                      | if (is_empty(r)): None else: r[0]
                    end
-      | [_jq_get_slice(base, from_v, to_v)]
+      | if (is_none(ast["base"])): [_jq_get_slice(input, from_v, to_v)]
+        else: do
+          let bases = _jq_eval(ast["base"], input, env)
+          | fold(bases, [], fn(acc, base): acc + [_jq_get_slice(base, from_v, to_v)];)
+        end
     end
     elif (node_type == "recurse_all"): _jq_recurse_collect(input)
     elif (node_type == "optional_expr"):
