@@ -26,6 +26,20 @@ Copy `jq.mq` to your mq module directory, or place it anywhere and reference it 
 cp jq.mq ~/.local/mq/config/
 ```
 
+### HTTP Import (no local installation needed)
+
+If `mq` was built with the `http-import` feature, you can import directly from GitHub without any local setup. This requires the `--allow-http-import` flag, which is disabled by default:
+
+```sh
+mq --allow-http-import -I null 'include "github.com/harehare/jq.mq" | jq_run(".[].name", .)' data.md
+```
+
+Pin to a specific release with `@vX.Y.Z`:
+
+```sh
+mq --allow-http-import -I null 'include "github.com/harehare/jq.mq@v1.0.0" | jq_run(".[].name", .)' data.md
+```
+
 ## Usage
 
 ```sh
