@@ -1496,40 +1496,11 @@ def _jq_first_out(c, v, env):
   | [got, res]
 end
 
-# Joins an array of arrays pairwise (O(n log n)); appends `tail` last.
-def _jq_concat_chunks(chunks, tail):
-  var level = chunks + [tail]
-  | let _ = while (len(level) > 1):
-      do
-        var nxt = []
-        | var i = 0
-        | let n = len(level)
-        | let _ = while (i < n):
-            do
-              nxt += [if (i + 1 < n): level[i] + level[i + 1] else: level[i]]
-              | i += 2
-            end
-          end
-        | level = nxt
-      end
-    end
-  | level[0]
-end
-
-# Collects all outputs of c(v, env) into an array. Appends go through small
-# chunks so that building large arrays stays linear.
+# Collects all outputs of c(v, env) into an array.
 def _jq_collect(c, v, env):
-  var chunks = []
-  | var cur = []
-  | var cnt = 0
-  | let _ = c(v, env, fn(x):
-      do
-        cur += [x]
-        | cnt += 1
-        | if (cnt >= 128): do chunks += [cur] | cur = [] | cnt = 0 end
-      end
-    ;)
-  | _jq_concat_chunks(chunks, cur)
+  var out = []
+  | let _ = c(v, env, fn(x): out += [x];)
+  | out
 end
 
 def _jq_first_or_null(c, v, env):
