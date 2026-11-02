@@ -1216,7 +1216,6 @@ def _jq_div(a, b):
   | let tb = type(b)
   | if (ta == "number" && tb == "number"):
       if (b == 0): error(_jq_dump(a) + " and " + _jq_dump(b) + " cannot be divided because the divisor is zero")
-      elif (b < 1e-10 && b > -1e-10): a * pow(b, -1)
       else: a / b
     elif (ta == "string" && tb == "string"): _jq_split_str(a, b)
     else: _jq_binop_err(a, b, "divided")

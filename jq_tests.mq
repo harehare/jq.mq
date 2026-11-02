@@ -498,6 +498,12 @@ def test_number_formatting_large_and_small_magnitudes():
   | assert_jq("1e-7 + 0 | tojson | fromjson", None, 1e-7)
 end
 
+def test_division_by_tiny_divisors():
+  assert_jq("[1 / 1e-17, -1 / 1e-17, 7 / 3e-300, 1 / 3e-16] | tojson", None, "[1e+17,-1e+17,2.3333333333333332e+300,3333333333333333.5]")
+  | assert_jq("[1e300 / 1e-300, 1 / 5e-324] | tojson", None, "[1.7976931348623157e+308,1.7976931348623157e+308]")
+  | assert_jq("try (1 / 0) catch .", None, "number (1) and number (0) cannot be divided because the divisor is zero")
+end
+
 def test_formats():
   assert_jq("@base64", "hello", "aGVsbG8=")
   | assert_jq("@base64 | @base64d", "hello", "hello")
