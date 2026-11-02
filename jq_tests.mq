@@ -516,18 +516,14 @@ def test_regex_long_input():
   | assert_jq("[splits(\"\\\\s+\")] | length", text, 9)
 end
 
-# jq refuses to work on values nested more than 10000 levels and on paths of more than 10000 keys.
-def test_depth_limits():
-  assert_jq("reduce range(10000) as $_ ([]; [.]) as $x | $x | contains($x)", None, true)
-  | assert_jq("try (reduce range(10001) as $_ ([]; [.]) as $x | $x | contains($x)) catch .", None, "Containment check too deep")
-  | assert_jq("try (reduce range(10001) as $_ ({}; {a: .}) as $x | $x * $x) catch .", None, "Object merge too deep")
-  | assert_jq("try (reduce range(10001) as $_ ([]; [.]) as $x | [$x, $x] | sort) catch .", None, "Comparison too deep")
-  | assert_jq("try (reduce range(10001) as $_ ([]; [.]) as $x | [$x, $x] | unique) catch .", None, "Comparison too deep")
-  | assert_jq("try setpath([range(10001) | 0]; 0) catch .", None, "Path too deep")
+# jq refuses paths of more than 10000 keys. The limits on comparing, merging, checking containment
+# and writing values nested more than 10000 levels are checked by the official test cases
+# (scripts/compat.py); building such values here would take minutes under mq-test.
+def test_path_depth_limit():
+  assert_jq("try setpath([range(10001) | 0]; 0) catch .", None, "Path too deep")
   | assert_jq("try getpath([range(10001) | 0]) catch .", None, "Path too deep")
   | assert_jq("try delpaths([[range(10001) | 0]]) catch .", None, "Path too deep")
-  | assert_jq("reduce range(10000) as $_ ([]; [.]) | tojson | [contains(\"skipped\"), length]", None, [false, 20002])
-  | assert_jq("reduce range(10001) as $_ ([]; [.]) | tojson | [contains(\"<skipped: too deep>\"), length]", None, [true, 20021])
+  | assert_jq("getpath([range(10000) | 0])", None, None)
 end
 
 def test_strindices_errors():
@@ -561,6 +557,32 @@ def test_api_results_keep_outputs_before_an_error():
   | assert_eq(jq_run_result("error({a: 1})", None, dict()), {"outputs": [], "error": "jq: error (not a string): {\"a\":1}"})
   | assert_eq(jq_run_result("1, (label $f | break $f), 2", None, dict()), {"outputs": [1, 2], "error": None})
   | assert_eq(jq_run_result("[inputs] | length", None, {inputs: [1, 2]}), {"outputs": [2], "error": None})
+end
+
+# ===== Diagnostics and local time =====
+
+def test_loc_reports_the_line():
+  assert_jq("$__loc__", None, {"file": "<top-level>", "line": 1})
+  | assert_jq("\n\n$__loc__.line", None, 3)
+  | assert_jq("1 | # comment\n  {a: $__loc__}.a.line", None, 2)
+end
+
+def test_debug_and_stderr_pass_their_input_through():
+  assert_jq("debug | . + 1", 1, 2)
+  | assert_jq("stderr | . + 1", 1, 2)
+  | assert_jq("debug(\"msg\") | . + 1", 1, 2)
+  | assert_jq("[.[] | debug]", [1, "a", None], [1, "a", None])
+end
+
+# The expected values do not depend on the time zone jq.mq runs in.
+def test_localtime_and_strflocaltime():
+  assert_jq("0 | strflocaltime(\"%s\")", None, "0")
+  | assert_jq("1425599621.678 | localtime | length", None, 8)
+  | assert_jq("1425599621.678 | localtime | (.[5] * 1000 | round) % 1000", None, 678)
+  | assert_jq("1425599621 | localtime | mktime - 1425599621 | . % 900", None, 0)
+  | assert_jq("1425599621 | (localtime | strflocaltime(\"%s\")) == strflocaltime(\"%s\")", None, true)
+  | assert_jq("1425599621 | strflocaltime(\"%z\") | test(\"^[+-][0-9]{4}$\")", None, true)
+  | assert_jq("try (\"x\" | localtime) catch .", None, "localtime() requires a number")
 end
 
 def test_division_by_tiny_divisors():

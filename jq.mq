@@ -225,7 +225,7 @@ def _jq_lex(src):
           do
             if (!_jq_is_ident_start(c2)): error("jq: syntax error: invalid variable name after $")
             | let name = _jq_read_ident(s, pos + 1, n)
-            | tokens += [{t: "var", v: name}]
+            | tokens += [if (name == "__loc__"): {t: "var", v: name, line: len(split(slice(s, 0, pos), "\n"))} else: {t: "var", v: name}]
             | pos += 1 + len(name)
             | pos
           end
@@ -394,7 +394,7 @@ def _jq_parse_object_entry(tokens, pos):
         | [{key: {type: "var_ref", name: tv}, val: r[0]}, r[1]]
       end
       elif (tv == "__loc__"):
-        [{key: _jq_lit("__loc__"), val: {type: "loc"}}, pos + 1]
+        [{key: _jq_lit("__loc__"), val: {type: "loc", line: tokens[pos]["line"]}}, pos + 1]
       else: [{key: _jq_lit(tv), val: {type: "var_ref", name: tv}}, pos + 1]
     end
     elif (tt == "str" || tt == "format"): do
@@ -607,7 +607,7 @@ def _jq_parse_primary(tokens, pos):
     end
     elif (tt == "dotdot"): [{type: "recurse_all"}, pos + 1]
     elif (tt == "var"): do
-      if (tv == "__loc__"): [{type: "loc"}, pos + 1]
+      if (tv == "__loc__"): [{type: "loc", line: tokens[pos]["line"]}, pos + 1]
       else: [{type: "var_ref", name: tv}, pos + 1]
     end
     elif (tt == "lparen"): do
@@ -1957,7 +1957,10 @@ def _jq_c(ast):
       | if (name == "ENV"): fn(v, env, k): k(_jq_env_dict());
         else: fn(v, env, k): k(env[key]);
     end
-    elif (ty == "loc"): fn(v, env, k): k({file: "<top-level>", line: 1});
+    elif (ty == "loc"): do
+      let line = ast["line"]
+      | fn(v, env, k): k({file: "<top-level>", line: line});
+    end
     elif (ty == "str"): do
       let parts = map(ast["parts"], fn(p): if (is_string(p)): p else: _jq_c(p);)
       | let fmt = ast["fmt"]
@@ -2160,6 +2163,30 @@ def _jq_recurse_all_p(p, v, k):
     | if (t == "array"): foreach (i, range(len(v) - 1)): _jq_recurse_all_p(p + [i], v[i], k) end
       elif (t == "dict"): foreach (key, keys(v)): _jq_recurse_all_p(p + [key], v[key], k) end
   end
+end
+
+# ----- Diagnostics -----
+# mq writes a line to standard error, so unlike jq these always end with a newline.
+
+# debug prints ["DEBUG:",value] and passes its input through.
+def _jq_debug(v):
+  let _ = stderr("[\"DEBUG:\"," + _jq_tojson(v) + "]")
+  | v
+end
+
+# stderr prints strings as they are and everything else as compact JSON.
+def _jq_stderr(v):
+  let _ = stderr(if (is_string(v)): v else: _jq_tojson(v))
+  | v
+end
+
+# halt_error prints strings as they are (a trailing newline is not doubled) and everything
+# else as JSON, nothing for null, then stops with the exit code.
+def _jq_halt_error(v, code):
+  let _ = if (is_none(v)): None
+    elif (is_string(v)): stderr(if (ends_with(v, "\n")): slice(v, 0, len(v) - 1) else: v)
+    else: stderr(_jq_tojson(v))
+  | halt(code)
 end
 
 def _jq_env_dict():
@@ -3053,8 +3080,10 @@ def _jq_builtin(name, args, argcs):
     elif (key == "env/0"): fn(v, env, k): k(_jq_env_dict());
     elif (key == "input/0"): fn(v, env, k): k(_jq_take_input(env));
     elif (key == "inputs/0"): fn(v, env, k): _jq_each_input(env, k);
-    elif (key == "debug/0"): fn(v, env, k): k(v);
-    elif (key == "stderr/0"): fn(v, env, k): k(v);
+    elif (key == "debug/0"): fn(v, env, k): k(_jq_debug(v));
+    elif (key == "stderr/0"): fn(v, env, k): k(_jq_stderr(v));
+    elif (key == "halt_error/0"): fn(v, env, k): _jq_halt_error(v, 5);
+    elif (key == "halt_error/1"): _jq_n1(fn(v, code): if (!is_number(code)): error("halt_error/1: number required") else: _jq_halt_error(v, code);, argcs[0])
     elif (key == "input_line_number/0"): fn(v, env, k): k(0);
     elif (key == "input_filename/0"): fn(v, env, k): k(env["*filename*"]);
     elif (key == "halt/0"): fn(v, env, k): halt();
@@ -3076,10 +3105,11 @@ def _jq_builtin(name, args, argcs):
     elif (key == "fmax/2"): _jq_n2(fn(v, a, b): if (a > b): a else: b;, argcs[0], argcs[1])
     elif (key == "toarray/0"): _jq_n0(fn(v): if (is_array(v)): v else: [v];)
     elif (key == "tostream/0"): None
-    elif (key == "gmtime/0" || key == "localtime/0"): _jq_n0(fn(v): _jq_gmtime(v);)
+    elif (key == "gmtime/0"): _jq_n0(fn(v): _jq_gmtime(v);)
+    elif (key == "localtime/0"): _jq_n0(fn(v): _jq_localtime(v);)
     elif (key == "mktime/0"): _jq_n0(fn(v): _jq_mktime(v);)
     elif (key == "strftime/1"): _jq_n1(fn(v, f): _jq_do_strftime(v, f, "strftime/1");, argcs[0])
-    elif (key == "strflocaltime/1"): _jq_n1(fn(v, f): _jq_do_strftime(v, f, "strflocaltime/1");, argcs[0])
+    elif (key == "strflocaltime/1"): _jq_n1(fn(v, f): _jq_do_strflocaltime(v, f);, argcs[0])
     elif (key == "strptime/1"): _jq_n1(fn(v, f): _jq_do_strptime(v, f);, argcs[0])
     elif (key == "abs/0"): _jq_n0(fn(v): if (_jq_cmp(v, 0) < 0): (if (is_number(v)): 0 - v else: error(_jq_dump(v) + " cannot be negated")) else: v;)
     elif (key == "toboolean/0"): _jq_n0(fn(v):
@@ -4350,7 +4380,7 @@ def _jq_months():
   ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
 end
 
-def _jq_strftime_one(spec, tm):
+def _jq_strftime_one(spec, tm, zone):
   let y = tm[0]
   | let mon = tm[1]
   | let d = tm[2]
@@ -4375,8 +4405,8 @@ def _jq_strftime_one(spec, tm):
     elif (spec == "S"): _jq_pad(s, 2, "0")
     elif (spec == "p"): if (h >= 12): "PM" else: "AM"
     elif (spec == "P"): if (h >= 12): "pm" else: "am"
-    elif (spec == "Z"): "UTC"
-    elif (spec == "z"): "+0000"
+    elif (spec == "Z"): if (is_none(zone)): "UTC" else: zone["name"]
+    elif (spec == "z"): if (is_none(zone)): "+0000" else: _jq_zone_offset(zone["off"])
     elif (spec == "a"): slice(_jq_weekdays()[wday], 0, 3)
     elif (spec == "A"): _jq_weekdays()[wday]
     elif (spec == "b" || spec == "h"): slice(_jq_months()[mon], 0, 3)
@@ -4384,29 +4414,44 @@ def _jq_strftime_one(spec, tm):
     elif (spec == "j"): _jq_pad(yday + 1, 3, "0")
     elif (spec == "u"): to_string(if (wday == 0): 7 else: wday)
     elif (spec == "w"): to_string(wday)
-    elif (spec == "s"): to_string(days * 86400 + h * 3600 + mi * 60 + s)
+    elif (spec == "s"): to_string(days * 86400 + h * 3600 + mi * 60 + s - (if (is_none(zone)): 0 else: zone["off"]))
     elif (spec == "U"): _jq_pad(floor((yday + 7 - wday) / 7), 2, "0")
     elif (spec == "W"): _jq_pad(floor((yday + 7 - _jq_fmod(wday + 6, 7)) / 7), 2, "0")
-    elif (spec == "T"): _jq_strftime(tm, "%H:%M:%S")
-    elif (spec == "D" || spec == "x"): _jq_strftime(tm, "%m/%d/%y")
-    elif (spec == "F"): _jq_strftime(tm, "%Y-%m-%d")
-    elif (spec == "R"): _jq_strftime(tm, "%H:%M")
-    elif (spec == "r"): _jq_strftime(tm, "%I:%M:%S %p")
-    elif (spec == "X"): _jq_strftime(tm, "%H:%M:%S")
-    elif (spec == "c"): _jq_strftime(tm, "%a %b %e %H:%M:%S %Y")
+    elif (spec == "T"): _jq_strftime(tm, "%H:%M:%S", zone)
+    elif (spec == "D" || spec == "x"): _jq_strftime(tm, "%m/%d/%y", zone)
+    elif (spec == "F"): _jq_strftime(tm, "%Y-%m-%d", zone)
+    elif (spec == "R"): _jq_strftime(tm, "%H:%M", zone)
+    elif (spec == "r"): _jq_strftime(tm, "%I:%M:%S %p", zone)
+    elif (spec == "X"): _jq_strftime(tm, "%H:%M:%S", zone)
+    elif (spec == "c"): _jq_strftime(tm, "%a %b %e %H:%M:%S %Y", zone)
     elif (spec == "n"): "\n"
     elif (spec == "t"): "\t"
     elif (spec == "%"): "%"
     else: "%" + spec
 end
 
-def _jq_strftime(tm, fmt):
+# +hhmm for an offset in seconds east of UTC.
+def _jq_zone_offset(off):
+  let a = if (off < 0): 0 - off else: off
+  | (if (off < 0): "-" else: "+") + _jq_pad(floor(a / 3600), 2, "0") + _jq_pad(floor((a - floor(a / 3600) * 3600) / 60), 2, "0")
+end
+
+# mq knows the offset of the local time zone but not its abbreviation, so the name is UTC
+# or the offset (+09, -0530).
+def _jq_zone(off):
+  let a = if (off < 0): 0 - off else: off
+  | let hh = _jq_pad(floor(a / 3600), 2, "0")
+  | let mm = floor((a - floor(a / 3600) * 3600) / 60)
+  | {off: off, name: if (off == 0): "UTC" else: (if (off < 0): "-" else: "+") + hh + (if (mm == 0): "" else: _jq_pad(mm, 2, "0"))}
+end
+
+def _jq_strftime(tm, fmt, zone):
   var out = ""
   | var i = 0
   | let cps = to_array(fmt)
   | let n = len(cps)
   | let _ = while (i < n):
-      if (cps[i] == "%" && i + 1 < n): do out += _jq_strftime_one(cps[i + 1], tm) | i += 2 end
+      if (cps[i] == "%" && i + 1 < n): do out += _jq_strftime_one(cps[i + 1], tm, zone) | i += 2 end
       else: do out += cps[i] | i += 1 end
     end
   | out
@@ -4416,7 +4461,33 @@ def _jq_do_strftime(v, fmt, who):
   if (!is_string(fmt)): error(who + " requires a string format")
   else: do
     let tm = if (is_number(v)): _jq_gmtime(v) elif (is_array(v)): _jq_check_tm(v, who) else: error(who + " requires parsed datetime inputs")
-    | _jq_strftime(tm, fmt)
+    | _jq_strftime(tm, fmt, None)
+  end
+end
+
+# The local time of a timestamp, in the time zone mq runs in (it follows TZ, daylight saving
+# time included). The fractional seconds are kept, like gmtime does.
+def _jq_localtime(t):
+  if (!is_number(t)): error("localtime() requires a number")
+  else: do
+    let secs = floor(t)
+    | let tm = localtime(secs)
+    | set(tm, 5, tm[5] + (t - secs))
+  end
+end
+
+# The offset of the local time zone at a broken down local time, in seconds east of UTC.
+def _jq_local_offset(tm):
+  let as_utc = _jq_mktime(tm)
+  | _jq_mktime(_jq_localtime(as_utc)) - as_utc
+end
+
+def _jq_do_strflocaltime(v, fmt):
+  if (!is_string(fmt)): error("strflocaltime/1 requires a string format")
+  else: do
+    let tm = if (is_number(v)): _jq_localtime(v) elif (is_array(v)): _jq_check_tm(v, "strflocaltime/1") else: error("strflocaltime/1 requires parsed datetime inputs")
+    | let off = if (is_number(v)): _jq_mktime(tm) - floor(v) else: _jq_local_offset(tm)
+    | _jq_strftime(tm, fmt, _jq_zone(off))
   end
 end
 
