@@ -21,3 +21,5 @@ jobs:
           bins: test
       - name: Run tests
         run: mq-test jq_tests.mq
+      - name: Run jq compatibility suite
+        run: python3 scripts/compat.py --min-pass 770
