@@ -77,6 +77,7 @@ jq.mq needs an mq newer than v0.10.0: `error(value)` with `e["value"]`, in-place
 
 ```sh
 mq-test jq_tests.mq
+python3 scripts/compat.py   # official jq test files (-v lists failures); MQ=/path/to/mq picks a build
 ```
 
 ## License
