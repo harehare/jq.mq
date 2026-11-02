@@ -3051,12 +3051,12 @@ def _jq_builtin(name, args, argcs):
     elif (key == "tojson/0"): _jq_n0(fn(v): _jq_tojson(v);)
     elif (key == "format/1"): _jq_n1(fn(v, f): _jq_format(f, v);, argcs[0])
     elif (key == "env/0"): fn(v, env, k): k(_jq_env_dict());
-    elif (key == "input/0"): fn(v, env, k): error("No more inputs");
-    elif (key == "inputs/0"): fn(v, env, k): None;
+    elif (key == "input/0"): fn(v, env, k): k(_jq_take_input(env));
+    elif (key == "inputs/0"): fn(v, env, k): _jq_each_input(env, k);
     elif (key == "debug/0"): fn(v, env, k): k(v);
     elif (key == "stderr/0"): fn(v, env, k): k(v);
     elif (key == "input_line_number/0"): fn(v, env, k): k(0);
-    elif (key == "input_filename/0"): fn(v, env, k): k(None);
+    elif (key == "input_filename/0"): fn(v, env, k): k(env["*filename*"]);
     elif (key == "halt/0"): fn(v, env, k): halt();
     elif (key == "now/0"): fn(v, env, k): k(now());
     elif (key == "infinite/0"): fn(v, env, k): k(infinite());
@@ -3311,11 +3311,55 @@ end
 
 # ===== Public API =====
 
+# The message the jq command line would print for an error that nothing caught.
+def _jq_top_message(v):
+  if (_jq_is_passing(v)): _jq_top_message(v["\u0003"])
+  elif (_jq_is_break(v)): "jq: error: break"
+  elif (is_string(v)): v
+  else: "jq: error (not a string): " + _jq_tojson(v)
+end
+
 def _jq_top_error(v):
-  if (_jq_is_passing(v)): _jq_top_error(v["\u0003"])
-  elif (_jq_is_break(v)): error("jq: error: break")
-  elif (is_string(v)): error(v)
-  else: error("jq: error (not a string): " + _jq_tojson(v))
+  error(_jq_top_message(v))
+end
+
+# ----- Inputs -----
+# `input` and `inputs` read the `inputs` option in order. The position is shared by the
+# whole run, so the environment carries two closures over it under the key "*in*".
+
+def _jq_make_inputs(items):
+  var pos = 0
+  | let n = len(items)
+  | {
+      has: fn(): pos < n;,
+      take: fn(): do
+        let x = items[pos]
+        | pos += 1
+        | x
+      end;
+    }
+end
+
+def _jq_take_input(env):
+  let io = env["*in*"]
+  | if (!is_none(io) && io["has"]()): io["take"]()
+    else: error("No more inputs")
+end
+
+def _jq_each_input(env, k):
+  let io = env["*in*"]
+  | if (!is_none(io)): while (io["has"]()): k(io["take"]()) end
+end
+
+# Builds the environment of a run from the options: `inputs` (values for input/inputs),
+# `named` ($name variables, as --arg/--argjson), `positional` ($ARGS.positional) and
+# `filename` (input_filename).
+def _jq_make_env(opts):
+  let named = if (is_none(opts["named"])): dict() else: opts["named"]
+  | let positional = if (is_none(opts["positional"])): [] else: opts["positional"]
+  | var env = {"*in*": _jq_make_inputs(if (is_none(opts["inputs"])): [] else: opts["inputs"]), "*filename*": opts["filename"], "$ARGS": {positional: positional, named: named}}
+  | let _ = foreach (name, keys(named)): env = set(env, "$" + name, named[name]) end
+  | env
 end
 
 def jq_compile(program):
@@ -3324,12 +3368,34 @@ def jq_compile(program):
 end
 
 def jq_eval(compiled, input):
-  try: _jq_collect(compiled["c"], input, dict())
+  jq_eval_opts(compiled, input, dict())
+end
+
+def jq_eval_opts(compiled, input, opts):
+  try: _jq_collect(compiled["c"], input, _jq_make_env(opts))
   catch(e): _jq_top_error(e["value"])
+end
+
+# Like jq_eval_opts, but returns the outputs produced before an error together with the
+# error: {outputs: [...], error: None or the message jq would print}.
+def jq_eval_result(compiled, input, opts):
+  var out = []
+  | var err = None
+  | let _ = (try: compiled["c"](input, _jq_make_env(opts), fn(x): out += [x];)
+      catch(e): err = _jq_top_message(e["value"]))
+  | {outputs: out, error: err}
 end
 
 def jq_run(program, input):
   jq_eval(jq_compile(program), input)
+end
+
+def jq_run_opts(program, input, opts):
+  jq_eval_opts(jq_compile(program), input, opts)
+end
+
+def jq_run_result(program, input, opts):
+  jq_eval_result(jq_compile(program), input, opts)
 end
 
 def jq_run_first(program, input):

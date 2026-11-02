@@ -18,17 +18,21 @@ import urllib.request
 
 # The mq binary to test; set MQ to try a build that is not first on PATH.
 MQ = os.environ.get("MQ", "mq")
+# The tests read the environment (PAGER=less, as jq's own test runner sets) and, later, module files.
+MQ_FLAGS = os.environ.get("MQ_FLAGS", "--allow-env --allow-read").split()
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CACHE = os.path.join(ROOT, "scripts", ".cache")
 URL = "https://raw.githubusercontent.com/jqlang/jq/jq-1.8.2/tests/{name}"
 SUITES = ["jq.test", "onig.test", "man.test", "manonig.test", "optional.test"]
 
+# Like jq's own test runner, an error after all the expected outputs have been produced is fine.
 RUNNER = r'''
 include "jq"
 | map(fn(c):
-    let r = try: {ok: true, got: jq_run(c["p"], c["i"])} catch(e): {ok: false, got: e["message"]}
-    | if (r["ok"]): (if (r["got"] == c["e"]): "PASS" else: "FAIL " + to_string(r["got"]))
-      else: "ERR " + r["got"]
+    let r = try: jq_run_result(c["p"], c["i"], dict()) catch(e): {outputs: [], error: e["message"], compile: true}
+    | if (r["outputs"] == c["e"] && is_none(r["compile"])): "PASS"
+      elif (!is_none(r["error"])): "ERR " + r["error"]
+      else: "FAIL " + to_string(r["outputs"])
   ;)
 '''
 
@@ -73,8 +77,9 @@ def run_chunk(cases, timeout):
         path = f.name
     try:
         r = subprocess.run(
-            [MQ, "-L", ROOT, "-I", "json", "-F", "json", RUNNER, path],
+            [MQ, *MQ_FLAGS, "-L", ROOT, "-I", "json", "-F", "json", RUNNER, path],
             capture_output=True, text=True, timeout=timeout,
+            env={**os.environ, "PAGER": "less"},
         )
     except subprocess.TimeoutExpired:
         return None

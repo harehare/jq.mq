@@ -535,6 +535,34 @@ def test_strindices_errors():
   | assert_jq("try _strindices(123) catch .", "abc", "number (123) is not a string")
 end
 
+# ===== API options =====
+
+def test_api_inputs():
+  assert_eq(jq_run_opts("[input, input]", None, {inputs: [1, 2, 3]}), [[1, 2]])
+  | assert_eq(jq_run_opts("[inputs]", None, {inputs: [1, None, "a"]}), [[1, None, "a"]])
+  | assert_eq(jq_run_opts("input | [., ([inputs] | length)]", None, {inputs: [7, 8, 9]}), [[7, 2]])
+  | assert_eq(jq_run_opts("[limit(2; inputs)], input", None, {inputs: [1, 2, 3, 4]}), [[1, 2], 3])
+  | assert_eq(jq_run_opts("try input catch .", None, {inputs: []}), ["No more inputs"])
+  | assert_eq(jq_run_opts("[inputs]", None, dict()), [[]])
+  | assert_eq(jq_run_opts("input_filename", None, {filename: "a.json"}), ["a.json"])
+  | assert_eq(jq_run_opts("input_filename", None, dict()), [None])
+end
+
+def test_api_named_arguments():
+  assert_eq(jq_run_opts("$frame + 1", None, {named: {frame: 6}}), [7])
+  | assert_eq(jq_run_opts("[$a, $b]", None, {named: {a: "x", b: [1]}}), [["x", [1]]])
+  | assert_eq(jq_run_opts("$ARGS", None, {named: {a: 1}, positional: ["p", "q"]}), [{"positional": ["p", "q"], "named": {"a": 1}}])
+  | assert_eq(jq_run_opts("$ARGS", None, dict()), [{"positional": [], "named": {}}])
+end
+
+def test_api_results_keep_outputs_before_an_error():
+  assert_eq(jq_run_result("1, 2, error(\"boom\"), 3", None, dict()), {"outputs": [1, 2], "error": "boom"})
+  | assert_eq(jq_run_result("1, 2", None, dict()), {"outputs": [1, 2], "error": None})
+  | assert_eq(jq_run_result("error({a: 1})", None, dict()), {"outputs": [], "error": "jq: error (not a string): {\"a\":1}"})
+  | assert_eq(jq_run_result("1, (label $f | break $f), 2", None, dict()), {"outputs": [1, 2], "error": None})
+  | assert_eq(jq_run_result("[inputs] | length", None, {inputs: [1, 2]}), {"outputs": [2], "error": None})
+end
+
 def test_division_by_tiny_divisors():
   assert_jq("[1 / 1e-17, -1 / 1e-17, 7 / 3e-300, 1 / 3e-16] | tojson", None, "[1e+17,-1e+17,2.3333333333333332e+300,3333333333333333.5]")
   | assert_jq("[1e300 / 1e-300, 1 / 5e-324] | tojson", None, "[1.7976931348623157e+308,1.7976931348623157e+308]")
