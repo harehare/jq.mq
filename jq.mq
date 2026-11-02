@@ -1477,7 +1477,7 @@ def _jq_setpath_rec(v, p, nv):
               let child = if (idx < n): arr[idx] else: None
               | let nc = _jq_setpath_rec(child, rest, nv)
               | if (idx < n): set(arr, idx, nc)
-                else: arr + fold(range(idx - n - 1), [], fn(a, _): a + [None];) + [nc]
+                else: arr + [None] * (idx - n) + [nc]
             end
         end
         else: error("Cannot index " + _jq_tn(v) + " with " + _jq_dump(h))

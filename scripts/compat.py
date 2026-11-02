@@ -36,11 +36,23 @@ RUNNER = r'''
 include "jq"
 | map(fn(c):
     let r = try: jq_run_result(c["p"], c["i"], {library_paths: [c["m"]]}) catch(e): {outputs: [], error: e["message"], compile: true}
-    | if (r["outputs"] == c["e"] && is_none(r["compile"])): "PASS"
+    | let got = jq_run("walk(if type == \"number\" and . == infinite then {\"$inf\": 1} elif type == \"number\" and . == -infinite then {\"$inf\": -1} else . end)", r["outputs"])[0]
+    | if (got == c["e"] && is_none(r["compile"])): "PASS"
       elif (!is_none(r["error"])): "ERR " + r["error"]
-      else: "FAIL " + to_string(r["outputs"])
+      else: "FAIL " + to_string(got)
   ;)
 '''
+
+
+def encode_infinity(value):
+    """JSON cannot carry infinity, so a marker object stands for it on the way to mq."""
+    if isinstance(value, float) and value in (float("inf"), float("-inf")):
+        return {"$inf": 1 if value > 0 else -1}
+    if isinstance(value, list):
+        return [encode_infinity(v) for v in value]
+    if isinstance(value, dict):
+        return {k: encode_infinity(v) for k, v in value.items()}
+    return value
 
 
 def load_cases(path):
@@ -80,7 +92,7 @@ def load_cases(path):
 def run_chunk(cases, timeout):
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
         modules = modules_dir()
-        json.dump([{"p": c["p"], "i": c["i"], "e": c["e"], "m": modules} for c in cases], f)
+        json.dump([{"p": c["p"], "i": encode_infinity(c["i"]), "e": encode_infinity(c["e"]), "m": modules} for c in cases], f)
         path = f.name
     try:
         r = subprocess.run(

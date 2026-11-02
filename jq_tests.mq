@@ -687,6 +687,14 @@ def test_modules_errors():
   | assert_eq(try modules_run("import \"util\" as $d; 1", None) catch(e): contains(e["message"], "Expected JSON value") || contains(e["message"], "module not found"), true)
 end
 
+# Assigning far past the end of an array pads it with nulls; this used to take quadratic time.
+def test_assignment_past_the_end_of_an_array():
+  assert_jq("[1, 2] | .[4] = 9", None, [1, 2, None, None, 9])
+  | assert_jq("[] | .[3] = 1 | length", None, 4)
+  | assert_jq("[] | .[100000] = 1 | length", None, 100001)
+  | assert_jq("reduce range(65540; 65536; -1) as $i ([]; .[$i] = $i) | .[65536:]", None, [None, 65537, 65538, 65539, 65540])
+end
+
 def test_division_by_tiny_divisors():
   assert_jq("[1 / 1e-17, -1 / 1e-17, 7 / 3e-300, 1 / 3e-16] | tojson", None, "[1e+17,-1e+17,2.3333333333333332e+300,3333333333333333.5]")
   | assert_jq("[1e300 / 1e-300, 1 / 5e-324] | tojson", None, "[1.7976931348623157e+308,1.7976931348623157e+308]")
