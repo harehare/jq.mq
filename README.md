@@ -76,11 +76,7 @@ jq.mq needs an mq newer than v0.10.0: `error(value)` with `e["value"]`, in-place
 ## Development
 
 ```sh
-mq-test jq_tests.mq                  # unit tests
-python3 scripts/compat.py            # official jq test files (-v lists failures); MQ=/path/to/mq picks a build
-python3 scripts/diff.py              # compare with the installed jq
-python3 scripts/limits.py            # recursion depth and large inputs, on the real mq
-python3 scripts/run_program.py prog.jq --stdin values.txt --argjson n=6 --raw   # jq vs jq.mq on a program file
+mq-test jq_tests.mq
 ```
 
 ## License
