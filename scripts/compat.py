@@ -24,12 +24,18 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CACHE = os.path.join(ROOT, "scripts", ".cache")
 URL = "https://raw.githubusercontent.com/jqlang/jq/jq-1.8.2/tests/{name}"
 SUITES = ["jq.test", "onig.test", "man.test", "manonig.test", "optional.test"]
+# The module files the tests import, searched like jq's `-L tests/modules`.
+MODULE_FILES = [
+    "a.jq", "b/b.jq", "c/c.jq", "c/d.jq", "data.json", "lib/jq/e/e.jq", "lib/jq/f.jq",
+    "shadow1.jq", "shadow2.jq", "syntaxerror/syntaxerror.jq", "test_bind_order.jq",
+    "test_bind_order0.jq", "test_bind_order1.jq", "test_bind_order2.jq",
+]
 
 # Like jq's own test runner, an error after all the expected outputs have been produced is fine.
 RUNNER = r'''
 include "jq"
 | map(fn(c):
-    let r = try: jq_run_result(c["p"], c["i"], dict()) catch(e): {outputs: [], error: e["message"], compile: true}
+    let r = try: jq_run_result(c["p"], c["i"], {library_paths: [c["m"]]}) catch(e): {outputs: [], error: e["message"], compile: true}
     | if (r["outputs"] == c["e"] && is_none(r["compile"])): "PASS"
       elif (!is_none(r["error"])): "ERR " + r["error"]
       else: "FAIL " + to_string(r["outputs"])
@@ -73,7 +79,8 @@ def load_cases(path):
 
 def run_chunk(cases, timeout):
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
-        json.dump([{"p": c["p"], "i": c["i"], "e": c["e"]} for c in cases], f)
+        modules = modules_dir()
+        json.dump([{"p": c["p"], "i": c["i"], "e": c["e"], "m": modules} for c in cases], f)
         path = f.name
     try:
         r = subprocess.run(
@@ -107,6 +114,17 @@ def run(cases, chunk, timeout):
         else:
             results.extend(out)
     return results
+
+
+def modules_dir():
+    """Downloads the test modules on first use and returns their directory."""
+    base = os.path.join(CACHE, "jq-1.8.2-modules")
+    for rel in MODULE_FILES:
+        path = os.path.join(base, rel)
+        if not os.path.exists(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            urllib.request.urlretrieve(URL.format(name="modules/" + rel), path)
+    return base
 
 
 def suite_path(name):

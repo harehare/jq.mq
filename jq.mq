@@ -840,6 +840,84 @@ def _jq_parse(src):
     end
 end
 
+# ----- Modules: directives -----
+# A program or module may start with `module {...};` and any number of
+# `import "path" as name [{...}];`, `import "path" as $name [{...}];` and `include "path" [{...}];`.
+
+# Whether an expression is a constant: literals, arrays and objects of constants.
+def _jq_is_const(ast):
+  let t = ast["type"]
+  | if (t == "literal"): true
+    elif (t == "neg"): _jq_is_const(ast["inner"])
+    elif (t == "comma"): _jq_is_const(ast["left"]) && _jq_is_const(ast["right"])
+    elif (t == "array"): is_none(ast["expr"]) || _jq_is_const(ast["expr"])
+    elif (t == "object"): fold(ast["entries"], true, fn(a, e): a && _jq_is_const(e["key"]) && _jq_is_const(e["val"]);)
+    else: false
+end
+
+# Parses the `{...}` metadata object at tokens[pos], which must be constant.
+def _jq_parse_const_object(tokens, pos):
+  let r = _jq_parse_object_ctor(tokens, pos + 1)
+  | if (!_jq_is_const(r[0])): error("jq: error: Module metadata must be constant")
+    else: [_jq_collect(_jq_c(r[0]), None, dict())[0], r[1]]
+end
+
+# Parses the directives at the start of a token list: [meta or None, deps, position].
+def _jq_parse_directives(tokens, pos0):
+  var pos = pos0
+  | var meta = None
+  | var deps = []
+  | let _ = if (_jq_tt(tokens, pos) == "ident" && _jq_tv(tokens, pos) == "module" && _jq_tt(tokens, pos + 1) == "lbrace"): do
+      let r = _jq_parse_const_object(tokens, pos + 1)
+      | meta = r[0]
+      | pos = _jq_expect(tokens, r[1], "semi")
+    end
+  | let _ = while (_jq_is_kw(tokens, pos, "import") || _jq_is_kw(tokens, pos, "include")):
+      do
+        let is_import = _jq_tv(tokens, pos) == "import"
+        | if (_jq_tt(tokens, pos + 1) != "str"): error("jq: error: Import path must be constant")
+        | let parts = tokens[pos + 1]["parts"]
+        | if (fold(parts, false, fn(a, q): a || q["t"] != "text";)): error("jq: error: Import path must be constant")
+        | let relpath = fold(parts, "", fn(a, q): a + q["v"];)
+        | var cur = pos + 2
+        | var alias = None
+        | var is_data = false
+        | let _ = if (is_import): do
+            cur = _jq_expect_kw(tokens, cur, "as")
+            | if (_jq_tt(tokens, cur) == "var"): do alias = _jq_tv(tokens, cur) | is_data = true end
+              elif (_jq_tt(tokens, cur) == "ident"): alias = _jq_tv(tokens, cur)
+              else: error("jq: syntax error: expected a module name after 'as'")
+            | cur += 1
+          end
+        | var dmeta = dict()
+        | let _ = if (_jq_tt(tokens, cur) == "lbrace"): do
+            let r = _jq_parse_const_object(tokens, cur)
+            | dmeta = r[0]
+            | cur = r[1]
+          end
+        | let _ = if (!is_dict(dmeta)): error("jq: error: Module metadata must be an object")
+        | cur = _jq_expect(tokens, cur, "semi")
+        | deps += [{relpath: relpath, alias: alias, is_data: is_data, meta: dmeta, is_include: !is_import}]
+        | pos = cur
+      end
+    end
+  | [meta, deps, pos]
+end
+
+# Parses a program or module file: {meta, deps, ast}.
+def _jq_parse_full(src):
+  let tokens = _jq_lex(src)
+  | let d = _jq_parse_directives(tokens, 0)
+  | let rest = d[2]
+  | if (_jq_tt(tokens, rest) == "eof"): {meta: d[0], deps: d[1], ast: {type: "identity"}}
+    else: do
+      let r = _jq_parse_pipe(tokens, rest)
+      | if (_jq_tt(tokens, r[1]) != "eof"):
+          error("jq: syntax error: unexpected '" + _jq_describe_tok(tokens, r[1]) + "'")
+        else: {meta: d[0], deps: d[1], ast: r[0]}
+    end
+end
+
 def jq_ast(program):
   _jq_parse(program)
 end
@@ -2117,6 +2195,22 @@ def _jq_c(ast):
       | let key = ast["name"] + "/" + to_string(len(params))
       | fn(v, env, k): nc(v, set(env, key, {params: params, body: bodyc, getp: getp, env: env, key: key}), k);
     end
+    elif (ty == "import_data"): do
+      let alias = ast["alias"]
+      | let value = ast["value"]
+      | let nc = _jq_c(ast["next"])
+      | fn(v, env, k): nc(v, set(set(env, "$" + alias, value), "$" + alias + "::" + alias, value), k);
+    end
+    elif (ty == "import_mod"): do
+      let mc = _jq_c(ast["unit"])
+      | let nc = _jq_c(ast["next"])
+      | let alias = ast["alias"]
+      | fn(v, env, k): mc(None, _jq_module_env(env), fn(exports): nc(v, _jq_bind_exports(env, exports, alias), k););
+    end
+    elif (ty == "export"): do
+      let defs = ast["defs"]
+      | fn(v, env, k): k(fold(defs, dict(), fn(acc, key): set(acc, key, env[key]);));
+    end
     elif (ty == "call"): _jq_c_call(ast)
     elif (ty == "assign"): _jq_c_assign(ast)
     else: error("jq: unknown AST node type: " + ty)
@@ -2463,6 +2557,15 @@ end
 # Parses a JSON text like jq: {v: value} or {e: message}, where the message ends with the
 # position and has no "(while parsing ...)" part yet.
 def _jq_json_parse(text):
+  _jq_json_parse_mode(text, false)
+end
+
+# Parses every value of a text, as jq reads a data file: {vs: [values]} or {e: message}.
+def _jq_json_parse_all(text):
+  _jq_json_parse_mode(text, true)
+end
+
+def _jq_json_parse_mode(text, every):
   let all = explode(text)
   | let cps = if (len(all) > 0 && all[0] == 65279): slice(all, 1, len(all)) else: all
   | let n = len(cps)
@@ -2478,6 +2581,7 @@ def _jq_json_parse(text):
   | var has = false
   | var count = 0
   | var first = None
+  | var values = []
   | var failure = None
   | let put = fn(v): if (has): "Expected separator between values" else: do next = v | has = true | None end;
   | let push = fn(kind, v):
@@ -2628,9 +2732,10 @@ def _jq_json_parse(text):
   | let done_value = fn(v): do
       count += 1
       | if (count == 1): first = v
+      | if (every): values += [v]
     end
     ;
-  | let _ = while (is_none(failure) && count < 2 && i < n):
+  | let _ = while (is_none(failure) && (every || count < 2) && i < n):
       do
         let c = cps[i]
         | i += 1
@@ -2688,7 +2793,7 @@ def _jq_json_parse(text):
       end
     end
   | if (!is_none(failure)): {e: failure}
-    elif (count >= 2): {e: "Unexpected extra JSON values"}
+    elif (count >= 2 && !every): {e: "Unexpected extra JSON values"}
     else: do
       let at_end = " at EOF at line " + to_string(line) + ", column " + to_string(col)
       | let lit = if (st != 0): "Unfinished string" else: literal()
@@ -2696,8 +2801,11 @@ def _jq_json_parse(text):
         elif (sp != 0): {e: "Unfinished JSON term" + at_end}
         elif (has): do
           let v = next
-          | if (count == 0): {v: v} else: {e: "Unexpected extra JSON values"}
+          | if (every): {vs: values + [v]}
+            elif (count == 0): {v: v}
+            else: {e: "Unexpected extra JSON values"}
         end
+        elif (every): {vs: values}
         elif (count == 1): {v: first}
         else: {e: "Expected JSON value"}
     end
@@ -3367,6 +3475,8 @@ def _jq_builtin(name, args, argcs):
     elif (key == "halt_error/1"): _jq_n1(fn(v, code): if (!is_number(code)): error("halt_error/1: number required") else: _jq_halt_error(v, code);, argcs[0])
     elif (key == "input_line_number/0"): fn(v, env, k): k(0);
     elif (key == "input_filename/0"): fn(v, env, k): k(env["*filename*"]);
+    elif (key == "modulemeta/0"): fn(v, env, k): k(_jq_module_meta(v, _jq_ctx(env)));
+    elif (key == "get_search_list/0"): fn(v, env, k): k(_jq_ctx(env)["libs"]);
     elif (key == "halt/0"): fn(v, env, k): halt();
     elif (key == "now/0"): fn(v, env, k): k(now());
     elif (key == "infinite/0"): fn(v, env, k): k(infinite());
@@ -3622,6 +3732,131 @@ end
 
 # ===== Public API =====
 
+# ----- Modules: linking -----
+# import and include are resolved when a program is compiled. A module is compiled as a chain of
+# definitions that ends in an `export` node; running it in an environment of its own gives the
+# function records the importer binds as alias::name (import) or name (include). A record keeps
+# the environment it was defined in, so a module's functions still see the module's own
+# definitions and imports. Data modules (`import "x" as $x;`) bind $x and $x::x to the array of
+# the values in x.json.
+
+def _jq_dirname(path):
+  let parts = split(path, "/")
+  | if (len(parts) <= 1): "."
+    else: do
+      let dir = join(slice(parts, 0, len(parts) - 1), "/")
+      | if (dir == ""): "/" else: dir
+    end
+end
+
+# The text of a module file, or None when it does not exist. The option module_sources (a dict
+# from the path a module would have to its text) is consulted before the file system.
+def _jq_read_module_file(path, sources):
+  if (!is_none(sources[path])): sources[path]
+  else: _jq_read_module_disk(path)
+end
+
+def _jq_read_module_disk(path):
+  try: read_file(path)
+  catch(e):
+    if (contains(e["message"], "filesystem reads are")): error("jq: error: reading module files needs mq's --allow-read option")
+    else: None
+end
+
+# Looks for relpath + suffix, or relpath/<last part of relpath> + suffix, in the directories
+# of `search` (relative to `base`, the directory of the importing file) and then in `libs`.
+def _jq_find_module(relpath, search, ctx, suffix, base):
+  let own = if (is_none(search)): [] elif (is_string(search)): [search] elif (is_array(search)): search else: error("jq: error: Module search path must be an array")
+  | let dirs = map(own, fn(p): if (starts_with(p, "/") || starts_with(p, "~")): p else: base + "/" + p;) + ctx["libs"]
+  | let parts = split(relpath, "/")
+  | let bname = parts[len(parts) - 1]
+  | var found = None
+  | let _ = foreach (d, dirs):
+      if (is_none(found)): do
+        let p1 = d + "/" + relpath + suffix
+        | let t1 = _jq_read_module_file(p1, ctx["sources"])
+        | if (!is_none(t1)): found = {path: p1, text: t1}
+          else: do
+            let p2 = d + "/" + relpath + "/" + bname + suffix
+            | let t2 = _jq_read_module_file(p2, ctx["sources"])
+            | if (!is_none(t2)): found = {path: p2, text: t2}
+          end
+      end
+    end
+  | if (is_none(found)): error("jq: error: module not found: " + relpath + " (search paths: " + join(dirs, ", ") + ")")
+    else: found
+end
+
+# The keys (name/arity) of the functions a chain of definitions defines.
+def _jq_chain_defs(ast):
+  let t = ast["type"]
+  | if (t == "def"): [ast["name"] + "/" + to_string(len(ast["params"]))] + _jq_chain_defs(ast["next"])
+    elif (t == "import_mod" || t == "import_data"): _jq_chain_defs(ast["next"])
+    else: []
+end
+
+def _jq_export_tail(ast, defs):
+  let t = ast["type"]
+  | if (t == "def" || t == "import_mod" || t == "import_data"): set(ast, "next", _jq_export_tail(ast["next"], defs))
+    else: {type: "export", defs: defs}
+end
+
+def _jq_link_dep(dep, body, base, ctx, stack):
+  let found = _jq_find_module(dep["relpath"], dep["meta"]["search"], ctx, if (dep["is_data"]): ".json" else: ".jq", base)
+  | if (dep["is_data"]): do
+      let r = _jq_json_parse_all(found["text"])
+      | if (!is_none(r["e"])): error("jq: error: " + r["e"] + " (while parsing '" + found["path"] + "')")
+        else: {type: "import_data", alias: dep["alias"], value: r["vs"], next: body}
+    end
+    else: do
+      if (contains(stack, found["path"])): error("jq: error: module cycle at " + found["path"])
+      | let unit = _jq_parse_full(found["text"])
+      | let linked = _jq_link(unit, _jq_dirname(found["path"]), ctx, stack + [found["path"]])
+      | {type: "import_mod", alias: dep["alias"], unit: _jq_with_prelude(_jq_export_tail(linked, _jq_chain_defs(linked))), next: body}
+    end
+end
+
+# Wraps the body of a parsed program or module in nodes that bind its imports; the first
+# import is the outermost, so a later import shadows an earlier one.
+def _jq_link(full, base, ctx, stack):
+  fold(reverse(full["deps"]), full["ast"], fn(body, dep): _jq_link_dep(dep, body, base, ctx, stack);)
+end
+
+# What `modulemeta` reports for a module name: its metadata, "deps" and "defs".
+def _jq_module_meta(name, ctx):
+  if (!is_string(name)): error("modulemeta input module name must be a string")
+  else: do
+    let found = _jq_find_module(name, None, ctx, ".jq", ".")
+    | let unit = _jq_parse_full(found["text"])
+    | let deps = map(unit["deps"], fn(d):
+        do
+          let m = if (is_none(d["alias"])): d["meta"] else: set(d["meta"], "as", d["alias"])
+          | set(set(m, "is_data", d["is_data"]), "relpath", d["relpath"])
+        end;)
+    | set(set(if (is_none(unit["meta"])): dict() else: unit["meta"], "deps", deps), "defs", _jq_chain_defs(unit["ast"]))
+  end
+end
+
+def _jq_ctx(env):
+  if (is_none(env["*ctx*"])): {libs: [], sources: dict()} else: env["*ctx*"]
+end
+
+# The search context of a run from its options: the library directories and the sources
+# of modules that are given as text.
+def _jq_make_ctx(opts):
+  {libs: if (is_none(opts["library_paths"])): [] else: opts["library_paths"],
+   sources: if (is_none(opts["module_sources"])): dict() else: opts["module_sources"]}
+end
+
+# The environment a module runs in: nothing of the importer, only what input and inputs need.
+def _jq_module_env(env):
+  {"*in*": env["*in*"], "*filename*": env["*filename*"], "*ctx*": env["*ctx*"]}
+end
+
+def _jq_bind_exports(env, exports, alias):
+  fold(keys(exports), env, fn(e, key): set(e, if (is_none(alias)): key else: alias + "::" + key, exports[key]);)
+end
+
 # The message the jq command line would print for an error that nothing caught.
 def _jq_top_message(v):
   if (_jq_is_passing(v)): _jq_top_message(v["\u0003"])
@@ -3668,13 +3903,18 @@ end
 def _jq_make_env(opts):
   let named = if (is_none(opts["named"])): dict() else: opts["named"]
   | let positional = if (is_none(opts["positional"])): [] else: opts["positional"]
-  | var env = {"*in*": _jq_make_inputs(if (is_none(opts["inputs"])): [] else: opts["inputs"]), "*filename*": opts["filename"], "$ARGS": {positional: positional, named: named}}
+  | var env = {"*in*": _jq_make_inputs(if (is_none(opts["inputs"])): [] else: opts["inputs"]), "*filename*": opts["filename"], "*ctx*": _jq_make_ctx(opts), "$ARGS": {positional: positional, named: named}}
   | let _ = foreach (name, keys(named)): env = set(env, "$" + name, named[name]) end
   | env
 end
 
 def jq_compile(program):
-  let ast = _jq_with_prelude(_jq_parse(program))
+  jq_compile_opts(program, dict())
+end
+
+# Like jq_compile; the option library_paths lists the directories import and include search.
+def jq_compile_opts(program, opts):
+  let ast = _jq_with_prelude(_jq_link(_jq_parse_full(program), ".", _jq_make_ctx(opts), []))
   | {c: _jq_c(ast), ast: ast}
 end
 
@@ -3702,11 +3942,11 @@ def jq_run(program, input):
 end
 
 def jq_run_opts(program, input, opts):
-  jq_eval_opts(jq_compile(program), input, opts)
+  jq_eval_opts(jq_compile_opts(program, opts), input, opts)
 end
 
 def jq_run_result(program, input, opts):
-  jq_eval_result(jq_compile(program), input, opts)
+  jq_eval_result(jq_compile_opts(program, opts), input, opts)
 end
 
 def jq_run_first(program, input):

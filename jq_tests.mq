@@ -624,6 +624,69 @@ def test_fromjson_accepts_jq_extensions():
 end
 
 
+# ===== Modules =====
+# The modules are given as text with the option module_sources, keyed by the path they would have,
+# so these tests do not need to read files. The official module tests (scripts/compat.py) cover
+# modules on disk.
+
+def module_sources():
+  {
+    "m/util.jq": "def shout(s): s | ascii_upcase; def one: 1; def one: 11;",
+    "m/greet.jq": "module {name: \"greet\", version: 2}; import \"util\" as u; def hello(n): \"hello \" + u::shout(n); def one: 100; def twice(f): f | f;",
+    "m/values.json": "1 [2, 3]\n{\"a\": 4}",
+    "m/pkg/pkg.jq": "def whoami: \"pkg\";",
+    "m/sub/inner.jq": "import \"util\" as u {search: \"..\"}; include \"pkg\" {search: \"../pkg/..\"}; def inner: u::shout(\"in\") + whoami;",
+    "m/shadow_a.jq": "def v: \"a\"; def w: \"a\";",
+    "m/shadow_b.jq": "def v: \"b\";",
+    "m/cycle_x.jq": "import \"cycle_y\" as y; def x: 1;",
+    "m/cycle_y.jq": "import \"cycle_x\" as x; def y: 2;",
+    "m/broken.jq": "def ok: 1; wat wat;"
+  }
+end
+
+def modules_run(program, input):
+  jq_run_opts(program, input, {library_paths: ["m"], module_sources: module_sources()})
+end
+
+def test_modules_import():
+  assert_eq(modules_run("import \"greet\" as g; g::hello(\"world\")", None), ["hello WORLD"])
+  | assert_eq(modules_run("import \"util\" as u; u::one", None), [11])
+  | assert_eq(modules_run("import \"greet\" as g; [g::twice(.+1)]", 0), [[2]])
+  | assert_eq(modules_run("import \"greet\" as g; import \"util\" as u; [g::one, u::one]", None), [[100, 11]])
+end
+
+# A module's own imports and helpers stay inside the module.
+def test_modules_hide_their_internals():
+  assert_eq(modules_run("import \"greet\" as g; try u::shout(\"x\") catch .", None), ["jq: error: u::shout/1 is not defined"])
+  | assert_eq(modules_run("import \"greet\" as g; try shout(\"x\") catch .", None), ["jq: error: shout/1 is not defined"])
+end
+
+def test_modules_include():
+  assert_eq(modules_run("include \"util\"; [shout(\"a\"), one]", None), [["A", 11]])
+  | assert_eq(modules_run("include \"shadow_a\"; include \"shadow_b\"; [v, w]", None), [["b", "a"]])
+  | assert_eq(modules_run("import \"shadow_a\" as s; import \"shadow_b\" as s; [s::v, s::w]", None), [["b", "a"]])
+end
+
+def test_modules_data_and_directories():
+  assert_eq(modules_run("import \"values\" as $v; $v", None), [[1, [2, 3], {"a": 4}]])
+  | assert_eq(modules_run("import \"values\" as $v; $v::v | length", None), [3])
+  | assert_eq(modules_run("import \"pkg\" as p; p::whoami", None), ["pkg"])
+  | assert_eq(modules_run("import \"sub/inner\" as i; i::inner", None), ["INpkg"])
+end
+
+def test_modulemeta():
+  assert_eq(modules_run("modulemeta", "greet"), [{"name": "greet", "version": 2, "deps": [{"as": "u", "is_data": false, "relpath": "util"}], "defs": ["hello/1", "one/0", "twice/1"]}])
+  | assert_eq(modules_run("modulemeta | .deps", "sub/inner"), [[{"search": "..", "as": "u", "is_data": false, "relpath": "util"}, {"search": "../pkg/..", "is_data": false, "relpath": "pkg"}]])
+  | assert_eq(modules_run("get_search_list", None), [["m"]])
+end
+
+def test_modules_errors():
+  assert_eq(try modules_run("import \"nope\" as n; 1", None) catch(e): contains(e["message"], "module not found: nope"), true)
+  | assert_eq(try modules_run("import \"cycle_x\" as x; 1", None) catch(e): contains(e["message"], "module cycle"), true)
+  | assert_eq(try modules_run("import \"broken\" as b; 1", None) catch(e): contains(e["message"], "syntax error"), true)
+  | assert_eq(try modules_run("import \"util\" as $d; 1", None) catch(e): contains(e["message"], "Expected JSON value") || contains(e["message"], "module not found"), true)
+end
+
 def test_division_by_tiny_divisors():
   assert_jq("[1 / 1e-17, -1 / 1e-17, 7 / 3e-300, 1 / 3e-16] | tojson", None, "[1e+17,-1e+17,2.3333333333333332e+300,3333333333333333.5]")
   | assert_jq("[1e300 / 1e-300, 1 / 5e-324] | tojson", None, "[1.7976931348623157e+308,1.7976931348623157e+308]")
