@@ -487,6 +487,17 @@ def test_number_formatting():
   | assert_jq("{a: {b: 1}} * {a: {c: 2}}", None, {"a": {"b": 1, "c": 2}})
 end
 
+# Exponent notation: mq prints 1e21 and up, and non-zero magnitudes below 1e-6, with an
+# exponent, and jq.mq has to turn that into jq's text.
+def test_number_formatting_large_and_small_magnitudes():
+  assert_jq("[1e300 + 0, -1e300 + 0, 1.5e22 + 0, 1e21 + 0, 1e20 + 0] | tojson", None, "[1e+300,-1e+300,1.5e+22,1e+21,1e+20]")
+  | assert_jq("[1e-7 + 0, -2.5e-10 + 0, 1e-6 + 0, 1.5e-5 + 0, 1e-4 + 0] | tojson", None, "[1e-07,-2.5e-10,1e-06,1.5e-05,0.0001]")
+  | assert_jq("[5e-324 + 0, 2.2250738585072014e-308 + 0, 1.7976931348623157e308 + 0] | tojson", None, "[5e-324,2.2250738585072014e-308,1.7976931348623157e+308]")
+  | assert_jq("[1e17 + 0, 123456789012345678 + 0, 12345678909876543212345 + 0] | tojson", None, "[1e+17,123456789012345680,12345678909876543000000]")
+  | assert_jq("[1e300 + 0, 1e-7 + 0] | map(tostring)", None, ["1e+300", "1e-07"])
+  | assert_jq("1e-7 + 0 | tojson | fromjson", None, 1e-7)
+end
+
 def test_formats():
   assert_jq("@base64", "hello", "aGVsbG8=")
   | assert_jq("@base64 | @base64d", "hello", "hello")

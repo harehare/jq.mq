@@ -899,10 +899,14 @@ def _jq_json_str(s):
   end
 end
 
-# Splits a plain decimal string into [digits, decpt]; digits has no leading/trailing zeros.
+# Formats the text mq prints for a number the way jq does. mq prints plain decimals, and
+# exponent notation (1.5e22, 1e-7) for magnitudes of 1e21 and up or below 1e-6.
 def _jq_numstr_slow(s):
   let neg = starts_with(s, "-")
-  | let body = if (neg): slice(s, 1, len(s)) else: s
+  | let unsigned = if (neg): slice(s, 1, len(s)) else: s
+  | let epos = index(unsigned, "e")
+  | let body = if (epos >= 0): slice(unsigned, 0, epos) else: unsigned
+  | let exp = if (epos >= 0): to_number(slice(unsigned, epos + 1, len(unsigned))) else: 0
   | let dot = index(body, ".")
   | let ip = if (dot >= 0): slice(body, 0, dot) else: body
   | let fp = if (dot >= 0): slice(body, dot + 1, len(body)) else: ""
@@ -913,7 +917,7 @@ def _jq_numstr_slow(s):
   | let _ = while (stop > lead && all[stop - 1] == "0"): stop -= 1 end
   | let digits = slice(all, lead, stop)
   | let nd = len(digits)
-  | let decpt = len(ip) - lead
+  | let decpt = len(ip) - lead + exp
   | let sign = if (neg): "-" else: ""
   | if (nd == 0): "0"
     elif (decpt <= -4 || decpt > nd + 15): do
