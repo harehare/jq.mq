@@ -2349,7 +2349,11 @@ def _jq_c_cps(ast):
       let name = ast["name"]
       | let key = "$" + name
       | if (name == "ENV"): fn(v, env, k): k(_jq_env_dict());
-        else: fn(v, env, k): k(env[key]);
+        else: fn(v, env, k): do
+            let x = env[key]
+            | if (is_none(x) && !contains(keys(env), key)): error("jq: error: $" + name + " is not defined")
+              else: k(x)
+          end;
     end
     elif (ty == "loc"): do
       let line = ast["line"]
