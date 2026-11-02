@@ -130,20 +130,20 @@ every compiled expression is a function `fn(input, env, emit)` that calls `emit`
 generators, `limit`/`first`/`label`, errors in the middle of a stream and path expressions behave like jq, and it is
 considerably faster than building an array for every intermediate result. Path expressions (`path(f)`, assignments,
 `del`) use a second compiled form that tracks paths alongside values. Builtins that jq defines in jq itself are
-parsed from a small prelude, and only when a program references them. Large arrays are built in chunks, so
-collecting 100k values stays linear.
+parsed from a small prelude, and only when a program references them. Collecting a stream into an array appends
+in place, so collecting 100k values stays linear.
 
 ## Known limitations
 
 - **Modules**: `import` / `include` / `modulemeta` inside jq programs are not supported.
-- **Recursion depth**: mq limits the call stack to 10 000 frames, so user-defined recursion that is not tail-recursive in jq is limited to roughly 600 levels (e.g. `fib` up to ~13). Builtins such as `range`, `recurse`, `until`, `while`, `repeat`, `limit`, `walk` and `paths` are not affected beyond the depth of the data. Very deeply nested data (≥ ~10 000 levels) also hits this limit.
+- **Recursion depth**: mq limits the call stack to 100,000 frames, and jq.mq spends about 15 of them on each level of a user-defined jq function, so recursion that is not a tail call in jq is limited to roughly 6,500 levels (`fib` up to 17). Exceeding it raises "Maximum recursion depth exceeded". Builtins such as `range`, `recurse`, `until`, `while`, `repeat`, `limit`, `walk` and `paths` are not affected beyond the depth of the data. Very deeply nested data (≥ ~100,000 levels) also hits this limit.
 - **Numbers**: numbers are IEEE doubles. jq 1.8's canonicalization of number literals (`100000000000000000000` stays as written, `1E+1000` is preserved) is not reproduced; computed values are formatted exactly like jq.
 - **Errors**: `jq_run` returns the array of outputs only if the program finishes; outputs produced before an uncaught error are not returned.
 - **`input` / `inputs` / `$__prog_args`**: there is no input stream, `inputs` is empty and `input` raises "No more inputs".
 - **`env` / `$ENV`**: the environment is only visible when mq is run with `--allow-env`; otherwise `$ENV` is an empty object.
 - **`localtime` / `strflocaltime` / `mktime`** treat all times as UTC.
 - **`debug` / `stderr`** pass their input through without printing.
-- Regular expressions use the engine in this module (Oniguruma-like semantics); exotic Oniguruma features such as `\X`, `\R`, absent operators and POSIX collating elements are not available.
+- Regular expressions use the engine in this module (Oniguruma-like semantics); exotic Oniguruma features such as `\X`, `\R`, absent operators and POSIX collating elements are not available. Inputs of 32 characters or more are matched by mq's native regex engine whenever the pattern allows it, which is much faster; patterns with lookaround, backreferences, atomic groups, possessive quantifiers, POSIX or Unicode property classes, `\Z`, or that can match the empty string are always run by the engine in this module.
 
 ## Development
 
@@ -153,6 +153,7 @@ mq-test jq_tests.mq
 
 # official jq test suites (jq.test, onig.test, man.test, manonig.test, optional.test of jq 1.8.2)
 python3 scripts/compat.py            # add -v to list failures, --suite jq.test to pick one
+MQ=/path/to/mq python3 scripts/compat.py   # test an mq build that is not first on PATH
 
 # differential test against the installed jq (compares outputs program by program)
 python3 scripts/diff.py
@@ -162,7 +163,16 @@ python3 scripts/diff.py
 
 ## Compatibility
 
-Developed and tested with [mq](https://github.com/harehare/mq) v0.10.0 (it relies on `catch(e)` binders and the standard `json` module).
+Developed and tested with [mq](https://github.com/harehare/mq) at a commit after v0.10.0. jq.mq relies on these mq features, which are not in v0.10.0:
+
+- `error(value)` accepts any value and `catch(e)` returns it as `e["value"]`;
+- appending to a variable captured by a closure (`a += [x]`) is done in place;
+- dividing by a tiny non-zero number is not a zero division, and `Number::is_int` is exact;
+- very large and small numbers print in exponent notation (`1e21`, `1e-7`);
+- `regex_match_info`, which returns match positions and capture groups;
+- a call depth limit of 100,000 (it was 10,000).
+
+jq.mq does not work correctly on v0.10.0: errors that carry non-string values are lost, so 681 instead of 786 of the 822 official test cases pass, and collecting a large result takes quadratic time.
 
 ## License
 
