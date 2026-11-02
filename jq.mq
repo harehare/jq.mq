@@ -2429,10 +2429,291 @@ def _jq_tonumber(v):
     else: error(_jq_dump(v) + " cannot be parsed as a number")
 end
 
+# ----- JSON parser -----
+# A port of jq's JSON parser (jv_parse.c, without the streaming and sequence modes), so that
+# fromjson reports the same errors at the same line and column (columns count bytes) and
+# accepts the same extensions: nan, NaN, Infinity, numbers like .5 and 1., and nesting up to
+# 10000 levels. mq's own parser handles the ordinary cases first.
+
+def _jq_json_utf8_len(c):
+  if (c < 128): 1 elif (c < 2048): 2 elif (c < 65536): 3 else: 4
+end
+
+# The number a numeric literal denotes, as [true, value], or [false] when it is not valid.
+def _jq_json_number(tok):
+  let neg = starts_with(tok, "-")
+  | let body = if (neg || starts_with(tok, "+")): slice(tok, 1, len(tok)) else: tok
+  | let lower = downcase(body)
+  | let sign = fn(x): if (neg): 0 - x else: x;
+  | if (lower == "inf" || lower == "infinity"): [true, sign(infinite())]
+    elif (is_regex_match(lower, "^s?nan0*$")): [true, nan()]
+    elif (is_regex_match(body, "^([0-9]+\\.?[0-9]*|\\.[0-9]+)([eE][+-]?[0-9]+)?$")): do
+      let epos = index(lower, "e")
+      | let mant = if (epos >= 0): slice(lower, 0, epos) else: lower
+      | let exp = if (epos >= 0): slice(lower, epos + 1, len(lower)) else: "0"
+      | let dot = index(mant, ".")
+      | let ip = if (dot >= 0): slice(mant, 0, dot) else: mant
+      | let fp = if (dot >= 0): slice(mant, dot + 1, len(mant)) else: ""
+      | let text = (if (ip == ""): "0" else: ip) + "." + (if (fp == ""): "0" else: fp) + "e" + exp
+      | [true, sign(try: to_number(text) catch: infinite())]
+    end
+    else: [false]
+end
+
+# Parses a JSON text like jq: {v: value} or {e: message}, where the message ends with the
+# position and has no "(while parsing ...)" part yet.
+def _jq_json_parse(text):
+  let all = explode(text)
+  | let cps = if (len(all) > 0 && all[0] == 65279): slice(all, 1, len(all)) else: all
+  | let n = len(cps)
+  | var i = 0
+  | var line = 1
+  | var col = 0
+  | var st = 0
+  | var tok = []
+  | var stack = []
+  | var kinds = []
+  | var sp = 0
+  | var next = None
+  | var has = false
+  | var count = 0
+  | var first = None
+  | var failure = None
+  | let put = fn(v): if (has): "Expected separator between values" else: do next = v | has = true | None end;
+  | let push = fn(kind, v):
+      do
+        if (sp == len(stack)): do stack += [v] | kinds += [kind] end
+        else: do stack[sp] = v | kinds[sp] = kind end
+        | sp += 1
+      end
+    ;
+  | let token = fn(ch):
+      if (ch == 91 || ch == 123):
+        if (sp >= 10000): "Exceeds depth limit for parsing"
+        elif (has): "Expected separator between values"
+        else: do push(if (ch == 91): "a" else: "o", if (ch == 91): [] else: dict()) | None end
+      elif (ch == 58):
+        if (!has): "Expected string key before ':'"
+        elif (sp == 0 || kinds[sp - 1] != "o"): "':' not as part of an object"
+        elif (!is_string(next)): "Object keys must be strings"
+        else: do push("k", next) | next = None | has = false | None end
+      elif (ch == 44):
+        if (!has): "Expected value before ','"
+        elif (sp == 0): "',' not as part of an object or array"
+        elif (kinds[sp - 1] == "a"): do stack[sp - 1] += [next] | next = None | has = false | None end
+        elif (kinds[sp - 1] == "k"): do
+          stack[sp - 2][stack[sp - 1]] = next
+          | sp -= 1
+          | stack[sp] = None
+          | next = None
+          | has = false
+          | None
+        end
+        else: "Objects must consist of key:value pairs"
+      elif (ch == 93):
+        if (sp == 0 || kinds[sp - 1] != "a"): "Unmatched ']'"
+        elif (!has && len(stack[sp - 1]) != 0): "Expected another array element"
+        else: do
+          if (has): stack[sp - 1] += [next]
+          | sp -= 1
+          | next = stack[sp]
+          | stack[sp] = None
+          | has = true
+          | None
+        end
+      elif (ch == 125):
+        if (sp == 0): "Unmatched '}'"
+        elif (has && kinds[sp - 1] != "k"): "Objects must consist of key:value pairs"
+        elif (!has && kinds[sp - 1] != "o"): "Unmatched '}'"
+        elif (!has && len(keys(stack[sp - 1])) != 0): "Expected another key-value pair"
+        else: do
+          if (has): do
+            stack[sp - 2][stack[sp - 1]] = next
+            | sp -= 1
+          end
+          | sp -= 1
+          | next = stack[sp]
+          | stack[sp] = None
+          | has = true
+          | None
+        end
+      else: None
+    ;
+  | let literal = fn():
+      if (len(tok) == 0): None
+      else: do
+        let word = implode(tok)
+        | let c0 = tok[0]
+        | let pattern = if (c0 == 116): "true" elif (c0 == 102): "false" elif (c0 == 110 && len(tok) > 1 && tok[1] == 117): "null" else: None
+        | let r = if (c0 == 39): "Invalid string literal; expected \", but got '"
+            elif (!is_none(pattern)): if (word != pattern): "Invalid literal" else: put(if (word == "true"): true elif (word == "false"): false else: None)
+            else: do
+              let num = _jq_json_number(word)
+              | if (!num[0]): "Invalid numeric literal" else: put(num[1])
+            end
+        | if (is_none(r)): do tok = [] | None end else: r
+      end
+    ;
+  | let finish = fn():
+      do
+        let cps_t = tok
+        | var out = []
+        | var j = 0
+        | var bad = None
+        | let m = len(cps_t)
+        | let hex4 = fn(at):
+            if (at + 4 > m): -2
+            else: do
+              var v = 0
+              | var k = 0
+              | var ok = true
+              | let _ = while (ok && k < 4):
+                  do
+                    let c = cps_t[at + k]
+                    | let d = if (c >= 48 && c <= 57): c - 48 elif (c >= 97 && c <= 102): c - 87 elif (c >= 65 && c <= 70): c - 55 else: -1
+                    | if (d < 0): ok = false else: v = v * 16 + d
+                    | k += 1
+                  end
+                end
+              | if (ok): v else: -1
+            end
+          ;
+        | let _ = while (is_none(bad) && j < m):
+            do
+              let c = cps_t[j]
+              | j += 1
+              | if (c == 92): do
+                  if (j >= m): bad = "Expected escape character at end of string"
+                  else: do
+                    let e = cps_t[j]
+                    | j += 1
+                    | if (e == 92 || e == 34 || e == 47): out += [e]
+                      elif (e == 98): out += [8]
+                      elif (e == 102): out += [12]
+                      elif (e == 116): out += [9]
+                      elif (e == 110): out += [10]
+                      elif (e == 114): out += [13]
+                      elif (e == 117): do
+                        let h = hex4(j)
+                        | if (h == -2): bad = "Invalid \\uXXXX escape"
+                          elif (h < 0): bad = "Invalid characters in \\uXXXX escape"
+                          else: do
+                            j += 4
+                            | var cp = h
+                            | if (cp >= 55296 && cp <= 56319): do
+                                let lo = if (j + 6 <= m && cps_t[j] == 92 && cps_t[j + 1] == 117): hex4(j + 2) else: -1
+                                | if (lo < 56320 || lo > 57343): bad = "Invalid \\uXXXX\\uXXXX surrogate pair escape"
+                                  else: do
+                                    cp = 65536 + (cp - 55296) * 1024 + (lo - 56320)
+                                    | j += 6
+                                  end
+                              end
+                            | if (is_none(bad)): out += [if (cp >= 55296 && cp <= 57343): 65533 else: cp]
+                          end
+                      end
+                      else: bad = "Invalid escape"
+                  end
+                end
+                elif (c < 32): bad = "Invalid string: control characters from U+0000 through U+001F must be escaped"
+                else: out += [c]
+            end
+          end
+        | if (!is_none(bad)): bad
+          else: do
+            let r = put(implode(out))
+            | if (is_none(r)): do tok = [] | None end else: r
+          end
+      end
+    ;
+  | let done_value = fn(v): do
+      count += 1
+      | if (count == 1): first = v
+    end
+    ;
+  | let _ = while (is_none(failure) && count < 2 && i < n):
+      do
+        let c = cps[i]
+        | i += 1
+        | col += _jq_json_utf8_len(c)
+        | let _ = if (c == 10): do line += 1 | col = 0 end
+        | let r = if (st != 0): do
+            if (c == 34 && st == 1): do
+              let e = finish()
+              | let _ = if (is_none(e)): do
+                  st = 0
+                  | if (sp == 0 && has): do
+                      let v = next
+                      | next = None
+                      | has = false
+                      | done_value(v)
+                    end
+                end
+              | e
+            end
+            else: do
+              tok += [c]
+              | st = if (c == 92 && st == 1): 2 else: 1
+              | None
+            end
+          end
+          else: do
+            let ws = c == 32 || c == 9 || c == 13 || c == 10
+            | let structure = c == 91 || c == 44 || c == 93 || c == 123 || c == 58 || c == 125
+            | if (!(ws || structure || c == 34)): do tok += [c] | None end
+              else: do
+                let e = literal()
+                | if (!is_none(e)): e
+                  else: do
+                    let mid_value = if (sp == 0 && has): next else: None
+                    | let mid_done = sp == 0 && has
+                    | let _ = if (mid_done): do next = None | has = false end
+                    | let e2 = if (structure): token(c) else: None
+                    | let e3 = if (c == 34): do st = 1 | None end else: e2
+                    | let late = sp == 0 && has
+                    | if (!is_none(e3)): e3
+                      else: do
+                        let _ = if (mid_done): done_value(mid_value)
+                        | let _ = if (late): do
+                            let v = next
+                            | next = None
+                            | has = false
+                            | done_value(v)
+                          end
+                        | None
+                      end
+                  end
+              end
+          end
+        | if (!is_none(r)): failure = r + " at line " + to_string(line) + ", column " + to_string(col)
+      end
+    end
+  | if (!is_none(failure)): {e: failure}
+    elif (count >= 2): {e: "Unexpected extra JSON values"}
+    else: do
+      let at_end = " at EOF at line " + to_string(line) + ", column " + to_string(col)
+      | let lit = if (st != 0): "Unfinished string" else: literal()
+      | if (!is_none(lit)): {e: lit + at_end}
+        elif (sp != 0): {e: "Unfinished JSON term" + at_end}
+        elif (has): do
+          let v = next
+          | if (count == 0): {v: v} else: {e: "Unexpected extra JSON values"}
+        end
+        elif (count == 1): {v: first}
+        else: {e: "Expected JSON value"}
+    end
+end
+
 def _jq_fromjson(v):
   if (!is_string(v)): error(_jq_dump(v) + " cannot be parsed as JSON")
-  elif (is_regex_match(v, "^\\s*-?[nN]a[nN]\\s*$")): nan()
-  else: try: json::json_parse(v) catch(e): error(e["message"] + " (while parsing '" + v + "')")
+  else: do
+    let fast = try: [json::json_parse(v)] catch: None
+    | if (!is_none(fast)): fast[0]
+      else: do
+        let r = _jq_json_parse(v)
+        | if (is_none(r["e"])): r["v"]
+          else: error(r["e"] + " (while parsing '" + v + "')")
+      end
+  end
 end
 
 def _jq_ascii_case(v, lo, hi, delta):

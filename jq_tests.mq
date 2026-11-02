@@ -585,6 +585,45 @@ def test_localtime_and_strflocaltime():
   | assert_jq("try (\"x\" | localtime) catch .", None, "localtime() requires a number")
 end
 
+# fromjson reports jq's errors with jq's line and column (columns count bytes). Expected values come from jq.
+def test_fromjson_errors():
+  assert_jq("try fromjson catch .", "{'a': 123}", "Invalid string literal; expected \", but got ' at line 1, column 5 (while parsing '{'a': 123}')")
+  | assert_jq("try fromjson catch .", "[1,2", "Unfinished JSON term at EOF at line 1, column 4 (while parsing '[1,2')")
+  | assert_jq("try fromjson catch .", "[1,2]]", "Unmatched ']' at line 1, column 6 (while parsing '[1,2]]')")
+  | assert_jq("try fromjson catch .", "{\"a\":1,}", "Expected another key-value pair at line 1, column 8 (while parsing '{\"a\":1,}')")
+  | assert_jq("try fromjson catch .", "{\"a\" 1}", "Expected separator between values at line 1, column 7 (while parsing '{\"a\" 1}')")
+  | assert_jq("try fromjson catch .", "{1:2}", "Object keys must be strings at line 1, column 3 (while parsing '{1:2}')")
+  | assert_jq("try fromjson catch .", "[1 2]", "Expected separator between values at line 1, column 5 (while parsing '[1 2]')")
+  | assert_jq("try fromjson catch .", "tru", "Invalid literal at EOF at line 1, column 3 (while parsing 'tru')")
+  | assert_jq("try fromjson catch .", "\"abc", "Unfinished string at EOF at line 1, column 4 (while parsing '\"abc')")
+  | assert_jq("try fromjson catch .", "\"a\\qb\"", "Invalid escape at line 1, column 6 (while parsing '\"a\\qb\"')")
+  | assert_jq("try fromjson catch .", "\"\\u12\"", "Invalid \\uXXXX escape at line 1, column 6 (while parsing '\"\\u12\"')")
+  | assert_jq("try fromjson catch .", "1 2", "Unexpected extra JSON values (while parsing '1 2')")
+  | assert_jq("try fromjson catch .", "", "Expected JSON value (while parsing '')")
+  | assert_jq("try fromjson catch .", "[,]", "Expected value before ',' at line 1, column 2 (while parsing '[,]')")
+  | assert_jq("try fromjson catch .", "[1,]", "Expected another array element at line 1, column 4 (while parsing '[1,]')")
+  | assert_jq("try fromjson catch .", "{\"a\"}", "Objects must consist of key:value pairs at line 1, column 5 (while parsing '{\"a\"}')")
+  | assert_jq("try fromjson catch .", "1e", "Invalid numeric literal at EOF at line 1, column 2 (while parsing '1e')")
+  | assert_jq("try fromjson catch .", "NaN1", "Invalid numeric literal at EOF at line 1, column 4 (while parsing 'NaN1')")
+  | assert_jq("try fromjson catch .", "1]", "Unmatched ']' at line 1, column 2 (while parsing '1]')")
+  | assert_jq("try fromjson catch .", "[1] x", "Invalid numeric literal at EOF at line 1, column 5 (while parsing '[1] x')")
+  | assert_jq("try fromjson catch .", "\"a\nb\"", "Invalid string: control characters from U+0000 through U+001F must be escaped at line 2, column 2 (while parsing '\"a\nb\"')")
+  | assert_jq("try fromjson catch .", "\"\\ud800\"", "Invalid \\uXXXX\\uXXXX surrogate pair escape at line 1, column 8 (while parsing '\"\\ud800\"')")
+end
+
+def test_fromjson_accepts_jq_extensions():
+  assert_jq("fromjson | isnan", "NaN", true)
+  | assert_jq("fromjson | isnan", "-nan", true)
+  | assert_jq("fromjson", ".5", 0.5)
+  | assert_jq("fromjson", "1.", 1)
+  | assert_jq("fromjson", "+1", 1)
+  | assert_jq("fromjson", "[\"\\ud83d\\ude00\"]", ["😀"])
+  | assert_jq("fromjson", "{\"a\":1,\"a\":2}", {"a": 2})
+  | assert_jq("fromjson | infinite == .", "Infinity", true)
+  | assert_jq("fromjson | length", "[" * 3000 + "]" * 3000, 1)
+end
+
+
 def test_division_by_tiny_divisors():
   assert_jq("[1 / 1e-17, -1 / 1e-17, 7 / 3e-300, 1 / 3e-16] | tojson", None, "[1e+17,-1e+17,2.3333333333333332e+300,3333333333333333.5]")
   | assert_jq("[1e300 / 1e-300, 1 / 5e-324] | tojson", None, "[1.7976931348623157e+308,1.7976931348623157e+308]")
