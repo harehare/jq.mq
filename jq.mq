@@ -1877,7 +1877,7 @@ def _jq_bind_params(rec, args, i, v, cenv, e, k):
           let nm = slice(p, 1, len(p))
           | a["c"](v, cenv, fn(x):
               _jq_bind_params(rec, args, i + 1, v, cenv,
-                set(set(e, p, x), nm + "/0", {c: fn(_v, _e, k2): k2(x);, cenv: None, pc: None, d: fn(_v, _e): x;}), k)
+                set(set(e, p, x), nm + "/0", a), k)
             ;)
         end
         else: _jq_bind_params(rec, args, i + 1, v, cenv, set(e, p + "/0", a), k)
@@ -2150,8 +2150,14 @@ end
 def _jq_mark_def(ast, scope):
   let params = ast["params"]
   | let key = ast["name"] + "/" + to_string(len(params))
-  | let candidate = fold(params, true, fn(a, p): a && starts_with(p, "$");)
-  | let inner = fold(params, scope, fn(sc, p): if (starts_with(p, "$")): set(sc, slice(p, 1, len(p)) + "/0", true) else: set(sc, p + "/0", false);)
+  # only value parameters used as variables: a body that calls the filter form of one (`a` for
+  # `$a`) needs the argument expression bound, which direct calls do not do
+  | let value_only = fold(params, true, fn(a, p): a && starts_with(p, "$");)
+  | let calls = if (value_only && !is_empty(params)): _jq_calls(ast["body"]) else: dict()
+  | let candidate = value_only && !fold(params, false, fn(a, p): a || !is_none(calls[slice(p, 1, len(p)) + "/0"]);)
+  # `def f($a)` also defines the filter a, which is the argument expression and may yield many
+  # outputs, so a body that calls it is not single
+  | let inner = fold(params, scope, fn(sc, p): set(sc, (if (starts_with(p, "$")): slice(p, 1, len(p)) else: p) + "/0", false);)
   | let optimistic = _jq_mark(ast["body"], set(inner, key, candidate))
   | let single = candidate && optimistic["s"] == true
   # a body marked under a false assumption about the function itself is marked again
@@ -2193,7 +2199,7 @@ def _jq_call_direct(rec, argds, v, env):
         do
           let p = params[i]
           | let x = argds[i](v, env)
-          | e = set(set(e, p, x), slice(p, 1, len(p)) + "/0", {c: fn(_v, _e, k2): k2(x);, cenv: None, pc: None, d: fn(_v, _e): x;})
+          | e = set(e, p, x)
         end
       end
     | rec["d"](v, e)

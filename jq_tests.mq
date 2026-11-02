@@ -751,6 +751,19 @@ def test_direct_evaluation_matches_jq():
 end
 
 
+# A value parameter is also a filter: `def f($a): a;`. Each parameter has its own value.
+def test_value_parameters_called_as_filters():
+  assert_jq("def f($a; $b; $c): [a, b, c]; f(1; 2; 3)", None, [1, 2, 3])
+  | assert_jq("def f($a; $b): [b, a, $a, $b]; f(1; 2)", None, [2, 1, 1, 2])
+  | assert_jq("[{\"w\": 3}] | def f($s; $i): s[$i].w; f(.; 0)", None, 3)
+  | assert_jq("[{\"w\": 3}, {\"w\": 5}] | def ipick($seq; $i; $r): $r - seq[$i].w | if . < 0 then $seq[$i] else ipick($seq; $i + 1; .) end; ipick(.; 0; 4)", None, {"w": 5})
+  | assert_jq("def f($a; $b): a + b * 10; [f(1, 2; 3)]", None, [31, 32, 31, 32])
+  | assert_jq("def f($a): 5 | a; f(.)", 9, 5)
+  | assert_jq("def f($a): [a, $a]; [f(1, 2)]", None, [[1, 2, 1], [1, 2, 2]])
+  | assert_jq("def f($a): $a + 1; [f(1, 2)]", None, [2, 3])
+  | assert_jq("def f($x): def g($y): x + y; g(10); f(1)", None, 11)
+end
+
 def test_division_by_tiny_divisors():
   assert_jq("[1 / 1e-17, -1 / 1e-17, 7 / 3e-300, 1 / 3e-16] | tojson", None, "[1e+17,-1e+17,2.3333333333333332e+300,3333333333333333.5]")
   | assert_jq("[1e300 / 1e-300, 1 / 5e-324] | tojson", None, "[1.7976931348623157e+308,1.7976931348623157e+308]")
