@@ -59,6 +59,19 @@ jq_run_result("1, 2, error(\"boom\"), 3", None, dict())
 
 Reading module files needs `mq --allow-read`, and `$ENV` needs `--allow-env`.
 
+## Compile to a single `.mqc` program
+
+Bundle jq.mq into one `jq.mqc` program that runs without `-L`:
+
+```sh
+mq compile -I json -L . -o jq.mqc 'include "jq" | jq_run(program, .)'
+
+echo '.[] | select(.age > 26) | .name' > query.jq
+mq --rawfile program query.jq -F json jq.mqc data.json
+```
+
+The `.mqc` format is experimental, so recompile after upgrading mq.
+
 ## Compatibility
 
 jq.mq needs an mq newer than v0.10.0: `error(value)` with `e["value"]`, in-place appends to captured variables, exact division and integer checks, exponent notation for numbers, `regex_match_info`, and a call depth limit of 100,000. On v0.10.0 only 603 of 822 official cases pass.
