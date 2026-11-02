@@ -695,6 +695,18 @@ def test_assignment_past_the_end_of_an_array():
   | assert_jq("reduce range(65540; 65536; -1) as $i ([]; .[$i] = $i) | .[65536:]", None, [None, 65537, 65538, 65539, 65540])
 end
 
+# Oniguruma constructs: \\R, \\X (approximated), the absent operator and \\p{M}. Expected values come from jq.
+def test_regex_extended_constructs():
+  assert_jq("[match(\"\\\\R\"; \"g\").string]", "a\r\nb\nc\u2028", ["\r\n", "\n", "\u2028"])
+  | assert_jq("[match(\"\\\\X\"; \"g\").string]", "e\u0301x", ["e\u0301", "x"])
+  | assert_jq("[match(\"\\\\X\"; \"g\").string]", "🇯🇵🇺🇸", ["🇯🇵", "🇺🇸"])
+  | assert_jq("[match(\"\\\\X\"; \"g\").string]", "👨\u200d👩x", ["👨\u200d👩", "x"])
+  | assert_jq("[match(\"(?~ab)\"; \"g\") | [.offset, .string]]", "abcab", [[0, ""], [1, "bc"], [3, ""], [4, "b"], [5, ""]])
+  | assert_jq("gsub(\"/\\\\*(?~\\\\*/)\\\\*/\"; \"\")", "a/*b*/c/*d*/", "ac")
+  | assert_jq("[match(\"\\\\p{M}+\"; \"g\").string]", "x\u0301\u0302y", ["\u0301\u0302"])
+  | assert_jq("[splits(\"\\\\R\")]", "l1\r\nl2\rl3\nl4", ["l1", "l2", "l3", "l4"])
+end
+
 def test_division_by_tiny_divisors():
   assert_jq("[1 / 1e-17, -1 / 1e-17, 7 / 3e-300, 1 / 3e-16] | tojson", None, "[1e+17,-1e+17,2.3333333333333332e+300,3333333333333333.5]")
   | assert_jq("[1e300 / 1e-300, 1 / 5e-324] | tojson", None, "[1.7976931348623157e+308,1.7976931348623157e+308]")
