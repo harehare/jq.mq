@@ -991,38 +991,28 @@ def _jq_dump(v):
 end
 
 # ----- Errors -----
-# Error values are carried as mq error messages. Non-string values are JSON encoded
-# behind \u0001; break signals use \u0002<id>; \u0003 marks errors that pass through
-# a `try` from its continuation.
+# A jq error is an mq error carrying the jq value: `error(v)` raises it and `e["value"]`
+# reads it back. Break signals are strings starting with \u0002; an error raised downstream
+# of a `try` is wrapped in a dict keyed \u0003 while it passes through the `try`.
 
-def _jq_throw(v):
-  if (is_string(v)): error(v)
-  else: error("\u0001" + _jq_tojson(v))
+def _jq_is_break(v):
+  is_string(v) && starts_with(v, "\u0002")
 end
 
-def _jq_err_value(msg):
-  if (starts_with(msg, "\u0001")): json::json_parse(slice(msg, 1, len(msg)))
-  else: msg
-end
-
-def _jq_is_break(msg):
-  starts_with(msg, "\u0002")
-end
-
-def _jq_rethrow(msg):
-  error(msg)
+def _jq_is_passing(v):
+  is_dict(v) && has(v, "\u0003")
 end
 
 # Runs `run(k2)`, forwarding outputs to `k`. Errors raised by `k` (downstream) are
-# not seen by `handler`; errors raised by `run` itself are passed to handler(msg).
+# not seen by `handler`; errors raised by `run` itself are passed to handler(value).
 def _jq_try_run(run, k, handler):
   try:
-    run(fn(x): try: k(x) catch(e): error("\u0003" + e["message"]);)
+    run(fn(x): try: k(x) catch(e): error({"\u0003": e["value"]});)
   catch(e):
     do
-      let m = e["message"]
-      | if (starts_with(m, "\u0003")): error(slice(m, 1, len(m)))
-        else: handler(m)
+      let v = e["value"]
+      | if (_jq_is_passing(v)): error(v["\u0003"])
+        else: handler(v)
     end
 end
 
@@ -1502,7 +1492,7 @@ def _jq_first_out(c, v, env):
   | let _ = (try:
       c(v, env, fn(x): do res = x | got = true | error(id) end;)
     catch(e):
-      if (e["message"] != id): error(e["message"]))
+      if (e["value"] != id): error(e["value"]))
   | [got, res]
 end
 
@@ -1638,7 +1628,7 @@ def _jq_pats_alt(cs, i, x, v, env, kb):
   if (i == len(cs) - 1): cs[i](x, v, env, kb)
   else: try: cs[i](x, v, env, kb)
     catch(e):
-      if (_jq_is_break(e["message"])): error(e["message"])
+      if (_jq_is_break(e["value"])): error(e["value"])
       else: _jq_pats_alt(cs, i + 1, x, v, env, kb)
 end
 
@@ -2039,7 +2029,7 @@ def _jq_c(ast):
             | let _ = _jq_try_run(
                 fn(k2): lc(v, env, fn(x): if (_jq_truthy(x)): do found = true | k2(x) end;);,
                 k,
-                fn(msg): if (_jq_is_break(msg)): error(msg) else: None;)
+                fn(err): if (_jq_is_break(err)): error(err) else: None;)
             | if (!found): rc(v, env, k)
           end;
     end
@@ -2062,11 +2052,11 @@ def _jq_c(ast):
     elif (ty == "try"): do
       let bc = _jq_c(ast["body"])
       | if (is_none(ast["handler"])):
-          fn(v, env, k): _jq_try_run(fn(k2): bc(v, env, k2);, k, fn(msg): if (_jq_is_break(msg)): error(msg) else: None;);
+          fn(v, env, k): _jq_try_run(fn(k2): bc(v, env, k2);, k, fn(err): if (_jq_is_break(err)): error(err) else: None;);
         else: do
           let hc = _jq_c(ast["handler"])
           | fn(v, env, k): _jq_try_run(fn(k2): bc(v, env, k2);, k,
-              fn(msg): if (_jq_is_break(msg)): error(msg) else: hc(_jq_err_value(msg), env, k););
+              fn(err): if (_jq_is_break(err)): error(err) else: hc(err, env, k););
         end
     end
     elif (ty == "bind"): do
@@ -2118,7 +2108,7 @@ def _jq_c(ast):
           do
             let id = "\u0002" + _jq_uid()
             | try: bc(v, set(env, key, id), k)
-              catch(e): if (e["message"] != id): error(e["message"])
+              catch(e): if (e["value"] != id): error(e["value"])
           end;
     end
     elif (ty == "break"): do
@@ -2246,7 +2236,7 @@ def _jq_cp(ast):
             | let _ = _jq_try_run(
                 fn(k2): lp(p, v, env, fn(p1, x): if (_jq_truthy(x)): do found = true | k2([p1, x]) end;);,
                 fn(pr): k(pr[0], pr[1]);,
-                fn(msg): if (_jq_is_break(msg)): error(msg) else: None;)
+                fn(err): if (_jq_is_break(err)): error(err) else: None;)
             | if (!found): rp(p, v, env, k)
           end;
     end
@@ -2254,11 +2244,11 @@ def _jq_cp(ast):
       let bp = _jq_cp(ast["body"])
       | if (is_none(ast["handler"])):
           fn(p, v, env, k): _jq_try_run(fn(k2): bp(p, v, env, fn(p1, x): k2([p1, x]););, fn(pr): k(pr[0], pr[1]);,
-            fn(msg): if (_jq_is_break(msg)): error(msg) else: None;);
+            fn(err): if (_jq_is_break(err)): error(err) else: None;);
         else: do
           let hp = _jq_cp(ast["handler"])
           | fn(p, v, env, k): _jq_try_run(fn(k2): bp(p, v, env, fn(p1, x): k2([p1, x]););, fn(pr): k(pr[0], pr[1]);,
-              fn(msg): if (_jq_is_break(msg)): error(msg) else: hp(None, _jq_err_value(msg), env, k););
+              fn(err): if (_jq_is_break(err)): error(err) else: hp(None, err, env, k););
         end
     end
     elif (ty == "bind"): do
@@ -2312,7 +2302,7 @@ def _jq_cp(ast):
           do
             let id = "\u0002" + _jq_uid()
             | try: bp(p, v, set(env, key, id), k)
-              catch(e): if (e["message"] != id): error(e["message"])
+              catch(e): if (e["value"] != id): error(e["value"])
           end;
     end
     elif (ty == "break"): do
@@ -2745,7 +2735,7 @@ def _jq_first_out_p(cp, p, v, env):
   | let _ = (try:
       cp(p, v, env, fn(p2, x): do res = x | rp = p2 | got = true | error(id) end;)
     catch(e):
-      if (e["message"] != id): error(e["message"]))
+      if (e["value"] != id): error(e["value"]))
   | [got, rp, res]
 end
 
@@ -2865,10 +2855,10 @@ def _jq_builtin(name, args, argcs):
   | if (!is_none(m1)): fn(v, env, k): k(m1(_jq_check_num(v)));
     elif (key == "empty/0"): fn(v, env, k): None;
     elif (key == "not/0"): fn(v, env, k): k(!_jq_truthy(v));
-    elif (key == "error/0"): fn(v, env, k): _jq_throw(v);
+    elif (key == "error/0"): fn(v, env, k): error(v);
     elif (key == "error/1"): do
       let c1 = argcs[0]
-      | fn(v, env, k): c1(v, env, fn(a): _jq_throw(a););
+      | fn(v, env, k): c1(v, env, fn(a): error(a););
     end
     elif (key == "type/0"): _jq_n0(fn(v): _jq_tn(v);)
     elif (key == "length/0"): _jq_n0(fn(v): _jq_length(v);)
@@ -3002,7 +2992,7 @@ def _jq_builtin(name, args, argcs):
                   if (cnt >= n): do res = x | got = true | error(id) end
                   | cnt += 1
                 end;)
-              catch(e): if (e["message"] != id): error(e["message"]))
+              catch(e): if (e["value"] != id): error(e["value"]))
             | if (got): k(res)
           end
         ;);
@@ -3160,10 +3150,10 @@ def _jq_builtin_p(name, args, argcs):
   let n = len(args)
   | let key = name + "/" + to_string(n)
   | if (key == "empty/0"): fn(p, v, env, k): None;
-    elif (key == "error/0"): fn(p, v, env, k): _jq_throw(v);
+    elif (key == "error/0"): fn(p, v, env, k): error(v);
     elif (key == "error/1"): do
       let c1 = argcs[0]
-      | fn(p, v, env, k): c1(v, env, fn(a): _jq_throw(a););
+      | fn(p, v, env, k): c1(v, env, fn(a): error(a););
     end
     elif (key == "select/1"): do
       let c1 = argcs[0]
@@ -3320,11 +3310,11 @@ end
 
 # ===== Public API =====
 
-def _jq_top_error(msg):
-  if (starts_with(msg, "\u0001")): error("jq: error (not a string): " + slice(msg, 1, len(msg)))
-  elif (_jq_is_break(msg)): error("jq: error: break")
-  elif (starts_with(msg, "\u0003")): error(slice(msg, 1, len(msg)))
-  else: error(msg)
+def _jq_top_error(v):
+  if (_jq_is_passing(v)): _jq_top_error(v["\u0003"])
+  elif (_jq_is_break(v)): error("jq: error: break")
+  elif (is_string(v)): error(v)
+  else: error("jq: error (not a string): " + _jq_tojson(v))
 end
 
 def jq_compile(program):
@@ -3334,7 +3324,7 @@ end
 
 def jq_eval(compiled, input):
   try: _jq_collect(compiled["c"], input, dict())
-  catch(e): _jq_top_error(e["message"])
+  catch(e): _jq_top_error(e["value"])
 end
 
 def jq_run(program, input):
