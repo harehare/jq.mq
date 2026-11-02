@@ -944,15 +944,21 @@ def _jq_numstr(n):
 end
 
 def _jq_tojson(v):
+  _jq_tojson_d(v, 0)
+end
+
+# jq writes "<skipped: too deep>" in place of anything nested more than 10000 levels.
+def _jq_tojson_d(v, d):
   let t = type(v)
   | if (t == "string"): _jq_json_str(v)
     elif (t == "number"): _jq_numstr(v)
     elif (t == "None"): "null"
     elif (t == "bool"): if (v): "true" else: "false"
-    elif (t == "array"): "[" + join(map(v, fn(x): _jq_tojson(x);), ",") + "]"
+    elif (d > 10000 && (t == "array" || t == "dict")): "<skipped: too deep>"
+    elif (t == "array"): "[" + join(map(v, fn(x): _jq_tojson_d(x, d + 1);), ",") + "]"
     elif (t == "dict"): do
       var parts = []
-      | let _ = foreach (k, keys(v)): parts += [_jq_json_str(k) + ":" + _jq_tojson(v[k])] end
+      | let _ = foreach (k, keys(v)): parts += [_jq_json_str(k) + ":" + _jq_tojson_d(v[k], d + 1)] end
       | "{" + join(parts, ",") + "}"
     end
     else: to_string(v)
@@ -1018,7 +1024,8 @@ end
 
 # ----- Comparison and sorting -----
 
-def _jq_cmp(a, b):
+# `d` is the nesting depth; jq refuses to compare values nested more than 10000 levels.
+def _jq_cmp(a, b, d = 0):
   let ra = _jq_rank(a)
   | let rb = _jq_rank(b)
   | if (ra != rb): if (ra < rb): -1 else: 1
@@ -1030,8 +1037,9 @@ def _jq_cmp(a, b):
       | let m = if (la < lb): la else: lb
       | var i = 0
       | var res = 0
+      | let _ = if (d > 10000): error("Comparison too deep")
       | let _ = while (res == 0 && i < m):
-          do res = _jq_cmp(a[i], b[i]) | i += 1 | res end
+          do res = _jq_cmp(a[i], b[i], d + 1) | i += 1 | res end
         end
       | if (res != 0): res
         elif (la < lb): -1
@@ -1041,14 +1049,15 @@ def _jq_cmp(a, b):
     elif (ra == 6): do
       let ka = sort(keys(a))
       | let kb = sort(keys(b))
-      | let kc = _jq_cmp(ka, kb)
+      | let kc = _jq_cmp(ka, kb, d + 1)
       | if (kc != 0): kc
         else: do
           var i = 0
           | var res = 0
           | let n = len(ka)
+          | let _ = if (d > 10000): error("Comparison too deep")
           | let _ = while (res == 0 && i < n):
-              do res = _jq_cmp(a[ka[i]], b[ka[i]]) | i += 1 | res end
+              do res = _jq_cmp(a[ka[i]], b[ka[i]], d + 1) | i += 1 | res end
             end
           | res
         end
@@ -1173,10 +1182,12 @@ def _jq_sub(a, b):
     else: _jq_binop_err(a, b, "subtracted")
 end
 
-def _jq_deep_merge(a, b):
+# `d` is the nesting depth; jq refuses to merge objects nested more than 10000 levels.
+def _jq_deep_merge(a, b, d = 0):
   var acc = a
+  | let _ = if (d > 10000): error("Object merge too deep")
   | let _ = foreach (k, keys(b)):
-      if (is_dict(acc[k]) && is_dict(b[k]) && contains(keys(acc), k)): acc = set(acc, k, _jq_deep_merge(acc[k], b[k]))
+      if (is_dict(acc[k]) && is_dict(b[k]) && contains(keys(acc), k)): acc = set(acc, k, _jq_deep_merge(acc[k], b[k], d + 1))
       else: acc = set(acc, k, b[k])
     end
   | acc
@@ -1342,8 +1353,10 @@ end
 
 # ----- Paths -----
 
+# jq refuses paths of more than 10000 keys.
 def _jq_getpath(v, p):
   if (!is_array(p)): error("Path must be specified as an array")
+  elif (len(p) > 10000): error("Path too deep")
   else: do
     var cur = v
     | var i = 0
@@ -1356,6 +1369,11 @@ def _jq_getpath(v, p):
 end
 
 def _jq_setpath(v, p, nv):
+  if (len(p) > 10000): error("Path too deep")
+  else: _jq_setpath_rec(v, p, nv)
+end
+
+def _jq_setpath_rec(v, p, nv):
   if (is_empty(p)): nv
   else: do
     let h = p[0]
@@ -1365,7 +1383,7 @@ def _jq_setpath(v, p, nv):
     | if (th == "string"):
         if (t == "dict" || t == "None"): do
           let base = if (t == "None"): dict() else: v
-          | set(base, h, _jq_setpath(base[h], rest, nv))
+          | set(base, h, _jq_setpath_rec(base[h], rest, nv))
         end
         else: error("Cannot index " + _jq_tn(v) + " with " + _jq_dump(h))
       elif (th == "number"):
@@ -1379,7 +1397,7 @@ def _jq_setpath(v, p, nv):
             elif (idx > 536870911): error("Array index too large")
             else: do
               let child = if (idx < n): arr[idx] else: None
-              | let nc = _jq_setpath(child, rest, nv)
+              | let nc = _jq_setpath_rec(child, rest, nv)
               | if (idx < n): set(arr, idx, nc)
                 else: arr + fold(range(idx - n - 1), [], fn(a, _): a + [None];) + [nc]
             end
@@ -1390,7 +1408,7 @@ def _jq_setpath(v, p, nv):
           let arr = if (t == "None"): [] else: v
           | let b = _jq_slice_bounds(len(arr), h["start"], h["end"])
           | let cur = slice(arr, b[0], b[1])
-          | let nc = _jq_setpath(cur, rest, nv)
+          | let nc = _jq_setpath_rec(cur, rest, nv)
           | if (!is_array(nc)): error("A slice of an array can only be assigned another array")
             else: slice(arr, 0, b[0]) + nc + slice(arr, b[1], len(arr))
         end
@@ -1464,7 +1482,10 @@ end
 def _jq_delpaths(v, paths):
   if (!is_array(paths)): error("Paths must be specified as an array")
   else: do
-    let _ = foreach (p, paths): if (!is_array(p)): error("Path must be specified as an array") end
+    let _ = foreach (p, paths):
+        if (!is_array(p)): error("Path must be specified as an array")
+        elif (len(p) > 10000): error("Path too deep")
+      end
     | if (is_empty(paths)): v
       elif (fold(paths, false, fn(a, p): a || is_empty(p);)): None
       else: _jq_dels(v, paths)
@@ -2354,13 +2375,15 @@ def _jq_has(v, key):
     else: error("Cannot check whether " + _jq_tn(v) + " has a " + (if (tk == "None"): "null" else: _jq_tn(key)) + " key")
 end
 
-def _jq_contains_in(a, b):
+# `d` is the nesting depth; jq refuses to check containment nested more than 10000 levels.
+def _jq_contains_in(a, b, d = 0):
   let ta = type(a)
   | let tb = type(b)
-  | if (ta == "dict" && tb == "dict"):
-      fold(keys(b), true, fn(acc, key): acc && contains(keys(a), key) && _jq_contains_in(a[key], b[key]);)
+  | if (d > 10000): error("Containment check too deep")
+    elif (ta == "dict" && tb == "dict"):
+      fold(keys(b), true, fn(acc, key): acc && contains(keys(a), key) && _jq_contains_in(a[key], b[key], d + 1);)
     elif (ta == "array" && tb == "array"):
-      fold(b, true, fn(acc, y): acc && fold(a, false, fn(f, x): f || _jq_contains_in(x, y););)
+      fold(b, true, fn(acc, y): acc && fold(a, false, fn(f, x): f || _jq_contains_in(x, y, d + 1););)
     elif (ta == "string" && tb == "string"): contains(a, b)
     else: a == b
 end
@@ -2459,6 +2482,13 @@ def _jq_join(v, sep):
       end
     | if (_jq_truthy(acc)): acc else: ""
   end
+end
+
+# The internal string-only variant behind indices/index/rindex on strings.
+def _jq_strindices(v, x):
+  if (!is_string(v)): error(_jq_dump(v) + " cannot be searched, as it is not a string")
+  elif (!is_string(x)): error(_jq_dump(x) + " is not a string")
+  else: _jq_indices(v, x)
 end
 
 def _jq_indices(v, x):
@@ -2856,7 +2886,8 @@ def _jq_builtin(name, args, argcs):
     elif (key == "rtrim/0"): _jq_n0(fn(v): _jq_trim(v, "r");)
     elif (key == "split/1"): _jq_n1(fn(v, a): _jq_split1(v, a);, argcs[0])
     elif (key == "join/1"): _jq_n1(fn(v, a): _jq_join(v, a);, argcs[0])
-    elif (key == "indices/1" || key == "_strindices/1"): _jq_n1(fn(v, a): _jq_indices(v, a);, argcs[0])
+    elif (key == "indices/1"): _jq_n1(fn(v, a): _jq_indices(v, a);, argcs[0])
+    elif (key == "_strindices/1"): _jq_n1(fn(v, a): _jq_strindices(v, a);, argcs[0])
     elif (key == "index/1"): _jq_n1(fn(v, a): do let r = _jq_indices(v, a) | if (is_none(r) || is_empty(r)): None else: r[0] end;, argcs[0])
     elif (key == "rindex/1"): _jq_n1(fn(v, a): do let r = _jq_indices(v, a) | if (is_none(r) || is_empty(r)): None else: r[len(r) - 1] end;, argcs[0])
     elif (key == "flatten/0"): _jq_n0(fn(v): _jq_flatten(_jq_iter_values(v), 1000000000);)

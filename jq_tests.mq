@@ -516,6 +516,25 @@ def test_regex_long_input():
   | assert_jq("[splits(\"\\\\s+\")] | length", text, 9)
 end
 
+# jq refuses to work on values nested more than 10000 levels and on paths of more than 10000 keys.
+def test_depth_limits():
+  assert_jq("reduce range(10000) as $_ ([]; [.]) as $x | $x | contains($x)", None, true)
+  | assert_jq("try (reduce range(10001) as $_ ([]; [.]) as $x | $x | contains($x)) catch .", None, "Containment check too deep")
+  | assert_jq("try (reduce range(10001) as $_ ({}; {a: .}) as $x | $x * $x) catch .", None, "Object merge too deep")
+  | assert_jq("try (reduce range(10001) as $_ ([]; [.]) as $x | [$x, $x] | sort) catch .", None, "Comparison too deep")
+  | assert_jq("try (reduce range(10001) as $_ ([]; [.]) as $x | [$x, $x] | unique) catch .", None, "Comparison too deep")
+  | assert_jq("try setpath([range(10001) | 0]; 0) catch .", None, "Path too deep")
+  | assert_jq("try getpath([range(10001) | 0]) catch .", None, "Path too deep")
+  | assert_jq("try delpaths([[range(10001) | 0]]) catch .", None, "Path too deep")
+  | assert_jq("reduce range(10000) as $_ ([]; [.]) | tojson | [contains(\"skipped\"), length]", None, [false, 20002])
+  | assert_jq("reduce range(10001) as $_ ([]; [.]) | tojson | [contains(\"<skipped: too deep>\"), length]", None, [true, 20021])
+end
+
+def test_strindices_errors():
+  assert_jq("try _strindices(\"abc\") catch .", 123, "number (123) cannot be searched, as it is not a string")
+  | assert_jq("try _strindices(123) catch .", "abc", "number (123) is not a string")
+end
+
 def test_division_by_tiny_divisors():
   assert_jq("[1 / 1e-17, -1 / 1e-17, 7 / 3e-300, 1 / 3e-16] | tojson", None, "[1e+17,-1e+17,2.3333333333333332e+300,3333333333333333.5]")
   | assert_jq("[1e300 / 1e-300, 1 / 5e-324] | tojson", None, "[1.7976931348623157e+308,1.7976931348623157e+308]")
