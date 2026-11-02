@@ -22,4 +22,6 @@ jobs:
       - name: Run tests
         run: mq-test jq_tests.mq
       - name: Run jq compatibility suite
-        run: python3 scripts/compat.py --min-pass 770
+        run: python3 scripts/compat.py --min-pass 800
+      - name: Check recursion depth and large inputs
+        run: python3 scripts/limits.py

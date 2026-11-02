@@ -1877,7 +1877,7 @@ def _jq_bind_params(rec, args, i, v, cenv, e, k):
           let nm = slice(p, 1, len(p))
           | a["c"](v, cenv, fn(x):
               _jq_bind_params(rec, args, i + 1, v, cenv,
-                set(set(e, p, x), nm + "/0", {c: fn(_v, _e, k2): k2(x);, cenv: None, pc: None}), k)
+                set(set(e, p, x), nm + "/0", {c: fn(_v, _e, k2): k2(x);, cenv: None, pc: None, d: fn(_v, _e): x;}), k)
             ;)
         end
         else: _jq_bind_params(rec, args, i + 1, v, cenv, set(e, p + "/0", a), k)
@@ -1998,7 +1998,317 @@ def _jq_binop_fn(op):
   else: fn(a, b): _jq_cmp(a, b) >= 0;
 end
 
+# ----- Single-output analysis and direct evaluation -----
+# The compiler below passes every output to a continuation, so each step of a computation
+# nests deeper in the call stack and nothing unwinds until the program ends: after about 8000
+# function calls the call depth limit of mq is reached. An expression that always yields exactly
+# one value (arithmetic, comparisons, if, pipes, field access, calls of functions whose body is
+# such an expression) is compiled to a function that returns its value instead, so the stack
+# unwinds after each step and the depth only follows the nesting of the calls.
+#
+# _jq_mark annotates every node with "s" (true if it yields exactly one output) and every def
+# with "ds" (true if the function can be called directly). A function qualifies if it has no
+# filter parameters (a filter might generate many outputs) and its body is single, assuming
+# the function itself is.
+
+# Builtins that map their input and their arguments to one value.
+def _jq_single_builtins():
+  {
+    "_strindices/1": true,
+    "abs/0": true,
+    "add/0": true,
+    "all/0": true,
+    "any/0": true,
+    "ascii_downcase/0": true,
+    "ascii_upcase/0": true,
+    "atan2/2": true,
+    "bsearch/1": true,
+    "builtins/0": true,
+    "contains/1": true,
+    "copysign/2": true,
+    "debug/0": true,
+    "delpaths/1": true,
+    "drem/2": true,
+    "endswith/1": true,
+    "env/0": true,
+    "explode/0": true,
+    "flatten/0": true,
+    "flatten/1": true,
+    "fma/3": true,
+    "fmax/2": true,
+    "fmin/2": true,
+    "fmod/2": true,
+    "format/1": true,
+    "fromjson/0": true,
+    "get_search_list/0": true,
+    "gmtime/0": true,
+    "halt_error/1": true,
+    "has/1": true,
+    "have_decnum/0": true,
+    "have_literal_numbers/0": true,
+    "hypot/2": true,
+    "implode/0": true,
+    "index/1": true,
+    "indices/1": true,
+    "infinite/0": true,
+    "input/0": true,
+    "input_filename/0": true,
+    "input_line_number/0": true,
+    "isinfinite/0": true,
+    "isnan/0": true,
+    "isnormal/0": true,
+    "join/1": true,
+    "keys/0": true,
+    "keys_unsorted/0": true,
+    "ldexp/2": true,
+    "length/0": true,
+    "localtime/0": true,
+    "ltrim/0": true,
+    "ltrimstr/1": true,
+    "max/0": true,
+    "min/0": true,
+    "mktime/0": true,
+    "modulemeta/0": true,
+    "nan/0": true,
+    "not/0": true,
+    "now/0": true,
+    "pow/2": true,
+    "reverse/0": true,
+    "rindex/1": true,
+    "rtrim/0": true,
+    "rtrimstr/1": true,
+    "scalb/2": true,
+    "scalbln/2": true,
+    "setpath/2": true,
+    "sort/0": true,
+    "split/1": true,
+    "startswith/1": true,
+    "stderr/0": true,
+    "strflocaltime/1": true,
+    "strftime/1": true,
+    "strptime/1": true,
+    "test/1": true,
+    "test/2": true,
+    "toarray/0": true,
+    "toboolean/0": true,
+    "tojson/0": true,
+    "tonumber/0": true,
+    "tostring/0": true,
+    "trim/0": true,
+    "trimstr/1": true,
+    "type/0": true,
+    "unique/0": true,
+    "utf8bytelength/0": true
+  }
+end
+
+def _jq_is_single_builtin(name, arity):
+  let key = name + "/" + to_string(arity)
+  | _jq_single_builtins()[key] == true || (arity == 0 && !is_none(_jq_math1(name)))
+end
+
+def _jq_all_single(exprs):
+  fold(exprs, true, fn(a, n): a && n["s"] == true;)
+end
+
+# Whether a node whose children are marked yields exactly one output.
+def _jq_node_single(n, scope):
+  let t = n["type"]
+  | if (t == "literal" || t == "identity" || t == "var_ref" || t == "loc" || t == "format" || t == "array"): true
+    elif (t == "field"): n["base"]["s"] == true
+    elif (t == "neg"): n["inner"]["s"] == true
+    elif (t == "index"): n["base"]["s"] == true && n["idx"]["s"] == true
+    elif (t == "slice"): n["base"]["s"] == true && (is_none(n["from"]) || n["from"]["s"] == true) && (is_none(n["to"]) || n["to"]["s"] == true)
+    elif (t == "binop" || t == "and" || t == "or" || t == "pipe"): n["left"]["s"] == true && n["right"]["s"] == true
+    elif (t == "if"): n["cond"]["s"] == true && n["then"]["s"] == true && (is_none(n["orelse"]) || n["orelse"]["s"] == true)
+    elif (t == "object"): fold(n["entries"], true, fn(a, e): a && e["key"]["s"] == true && e["val"]["s"] == true;)
+    elif (t == "str"): fold(n["parts"], true, fn(a, p): a && (is_string(p) || p["s"] == true);)
+    elif (t == "bind"): len(n["pats"]) == 1 && n["pats"][0]["kind"] == "var" && n["src"]["s"] == true && n["body"]["s"] == true
+    elif (t == "def"): n["next"]["s"] == true
+    elif (t == "call"): do
+      let key = n["name"] + "/" + to_string(len(n["args"]))
+      | let known = scope[key]
+      | _jq_all_single(n["args"]) && (if (is_none(known)): _jq_is_single_builtin(n["name"], len(n["args"])) else: known)
+    end
+    else: false
+end
+
+def _jq_mark_value(x, scope):
+  if (is_dict(x)):
+    if (is_string(x["type"])): _jq_mark(x, scope)
+    else: fold(keys(x), x, fn(acc, key): set(acc, key, _jq_mark_value(x[key], scope));)
+  elif (is_array(x)): map(x, fn(y): _jq_mark_value(y, scope);)
+  else: x
+end
+
+def _jq_mark_children(ast, scope):
+  let skip = ast["type"] == "literal"
+  | if (skip): ast
+    else: fold(keys(ast), ast, fn(acc, key): if (key == "type"): acc else: set(acc, key, _jq_mark_value(ast[key], scope));)
+end
+
+def _jq_mark_def(ast, scope):
+  let params = ast["params"]
+  | let key = ast["name"] + "/" + to_string(len(params))
+  | let candidate = fold(params, true, fn(a, p): a && starts_with(p, "$");)
+  | let inner = fold(params, scope, fn(sc, p): if (starts_with(p, "$")): set(sc, slice(p, 1, len(p)) + "/0", true) else: set(sc, p + "/0", false);)
+  | let optimistic = _jq_mark(ast["body"], set(inner, key, candidate))
+  | let single = candidate && optimistic["s"] == true
+  # a body marked under a false assumption about the function itself is marked again
+  | let body = if (candidate && !single): _jq_mark(ast["body"], set(inner, key, false)) else: optimistic
+  | let nxt = _jq_mark(ast["next"], set(scope, key, single))
+  | set(set(set(set(ast, "body", body), "next", nxt), "ds", single), "s", nxt["s"] == true)
+end
+
+# Marks the single-output expressions of a program. `scope` maps name/arity to whether the
+# function in scope is single; a name that is absent is a builtin.
+def _jq_mark(ast, scope):
+  let t = ast["type"]
+  | if (t == "def"): _jq_mark_def(ast, scope)
+    elif (t == "import_mod"): set(set(ast, "unit", _jq_mark(ast["unit"], dict())), "next", _jq_mark(ast["next"], scope))
+    else: do
+      let marked = _jq_mark_children(ast, scope)
+      | set(marked, "s", _jq_node_single(marked, scope))
+    end
+end
+
+# The value of an expression that yields exactly one output, found by running its continuation
+# passing form; the stack unwinds as soon as the output has been taken.
+def _jq_direct_of(c):
+  fn(v, env): do
+    var r = None
+    | let _ = c(v, env, fn(x): r = x;)
+    | r
+  end;
+end
+
+# Calls a function defined by a single body: evaluates the value parameters and runs the
+# direct body.
+def _jq_call_direct(rec, argds, v, env):
+  if (is_none(rec["params"])): rec["d"](v, env)
+  else: do
+    let params = rec["params"]
+    | var e = set(rec["env"], rec["key"], rec)
+    | let _ = if (!is_empty(params)): foreach (i, range(len(params) - 1)):
+        do
+          let p = params[i]
+          | let x = argds[i](v, env)
+          | e = set(set(e, p, x), slice(p, 1, len(p)) + "/0", {c: fn(_v, _e, k2): k2(x);, cenv: None, pc: None, d: fn(_v, _e): x;})
+        end
+      end
+    | rec["d"](v, e)
+  end
+end
+
+# The function record a def adds to the environment.
+def _jq_def_record(params, bodyc, getp, bodyd, env, key):
+  {params: params, body: bodyc, getp: getp, env: env, key: key, d: bodyd}
+end
+
+# Compiles an expression marked single to a function fn(input, env) that returns its value.
+def _jq_cd(ast):
+  let t = ast["type"]
+  | if (t == "literal"): do
+      let val = ast["value"]
+      | fn(v, env): val;
+    end
+    elif (t == "identity"): fn(v, env): v;
+    elif (t == "field"): do
+      let name = ast["name"]
+      | if (ast["base"]["type"] == "identity"): fn(v, env): _jq_field(v, name);
+        else: do
+          let bd = _jq_cd(ast["base"])
+          | fn(v, env): _jq_field(bd(v, env), name);
+        end
+    end
+    elif (t == "index"): do
+      let bd = _jq_cd(ast["base"])
+      | let id = _jq_cd(ast["idx"])
+      | fn(v, env): do
+          let i = id(v, env)
+          | _jq_index(bd(v, env), i)
+        end;
+    end
+    elif (t == "neg"): do
+      let id = _jq_cd(ast["inner"])
+      | fn(v, env): do
+          let x = id(v, env)
+          | if (is_number(x)): 0 - x else: error(_jq_dump(x) + " cannot be negated")
+        end;
+    end
+    elif (t == "binop"): do
+      let ld = _jq_cd(ast["left"])
+      | let rd = _jq_cd(ast["right"])
+      | let opf = _jq_binop_fn(ast["op"])
+      | if (ast["right"]["type"] == "literal"): do
+          let rv = ast["right"]["value"]
+          | fn(v, env): opf(ld(v, env), rv);
+        end
+        else: fn(v, env): do
+          let b = rd(v, env)
+          | opf(ld(v, env), b)
+        end;
+    end
+    elif (t == "and"): do
+      let ld = _jq_cd(ast["left"])
+      | let rd = _jq_cd(ast["right"])
+      | fn(v, env): if (!_jq_truthy(ld(v, env))): false else: _jq_truthy(rd(v, env));
+    end
+    elif (t == "or"): do
+      let ld = _jq_cd(ast["left"])
+      | let rd = _jq_cd(ast["right"])
+      | fn(v, env): if (_jq_truthy(ld(v, env))): true else: _jq_truthy(rd(v, env));
+    end
+    elif (t == "pipe"): do
+      let ld = _jq_cd(ast["left"])
+      | let rd = _jq_cd(ast["right"])
+      | fn(v, env): rd(ld(v, env), env);
+    end
+    elif (t == "if"): do
+      let cd = _jq_cd(ast["cond"])
+      | let td = _jq_cd(ast["then"])
+      | let ed = if (is_none(ast["orelse"])): fn(v, env): v; else: _jq_cd(ast["orelse"])
+      | fn(v, env): if (_jq_truthy(cd(v, env))): td(v, env) else: ed(v, env);
+    end
+    elif (t == "bind"): do
+      let sd = _jq_cd(ast["src"])
+      | let bd = _jq_cd(ast["body"])
+      | let key = "$" + ast["pats"][0]["name"]
+      | fn(v, env): bd(v, set(env, key, sd(v, env)));
+    end
+    elif (t == "def"): do
+      let bodyc = _jq_c(ast["body"])
+      | let getp = _jq_lazy_path(ast["body"])
+      | let nd = _jq_cd(ast["next"])
+      | let bodyd = if (ast["ds"] == true): _jq_cd(ast["body"]) else: None
+      | let params = ast["params"]
+      | let key = ast["name"] + "/" + to_string(len(params))
+      | fn(v, env): nd(v, set(env, key, _jq_def_record(params, bodyc, getp, bodyd, env, key)));
+    end
+    elif (t == "call" && len(ast["args"]) == 0 || t == "call" && _jq_all_single(ast["args"])): do
+      let key = ast["name"] + "/" + to_string(len(ast["args"]))
+      | let argds = map(ast["args"], fn(a): _jq_cd(a);)
+      | let fallback = _jq_direct_of(_jq_c_cps(ast))
+      | fn(v, env): do
+          let rec = env[key]
+          | if (is_none(rec) || is_none(rec["d"])): fallback(v, env)
+            else: _jq_call_direct(rec, argds, v, env)
+        end;
+    end
+    else: _jq_direct_of(_jq_c_cps(ast))
+end
+
+# Compiles an expression. Single-output expressions other than leaves are evaluated directly.
 def _jq_c(ast):
+  let t = ast["type"]
+  | if (ast["s"] == true && t != "literal" && t != "identity" && t != "var_ref" && t != "format" && t != "loc"): do
+      let d = _jq_cd(ast)
+      | fn(v, env, k): k(d(v, env));
+    end
+    else: _jq_c_cps(ast)
+end
+
+def _jq_c_cps(ast):
   let ty = ast["type"]
   | if (ty == "literal"): do
       let val = ast["value"]
@@ -2191,9 +2501,10 @@ def _jq_c(ast):
       let bodyc = _jq_c(ast["body"])
       | let getp = _jq_lazy_path(ast["body"])
       | let nc = _jq_c(ast["next"])
+      | let bodyd = if (ast["ds"] == true): _jq_cd(ast["body"]) else: None
       | let params = ast["params"]
       | let key = ast["name"] + "/" + to_string(len(params))
-      | fn(v, env, k): nc(v, set(env, key, {params: params, body: bodyc, getp: getp, env: env, key: key}), k);
+      | fn(v, env, k): nc(v, set(env, key, _jq_def_record(params, bodyc, getp, bodyd, env, key)), k);
     end
     elif (ty == "import_data"): do
       let alias = ast["alias"]
@@ -3889,7 +4200,7 @@ end
 def _jq_take_input(env):
   let io = env["*in*"]
   | if (!is_none(io) && io["has"]()): io["take"]()
-    else: error("No more inputs")
+    else: error("break")
 end
 
 def _jq_each_input(env, k):
@@ -3914,7 +4225,7 @@ end
 
 # Like jq_compile; the option library_paths lists the directories import and include search.
 def jq_compile_opts(program, opts):
-  let ast = _jq_with_prelude(_jq_link(_jq_parse_full(program), ".", _jq_make_ctx(opts), []))
+  let ast = _jq_mark(_jq_with_prelude(_jq_link(_jq_parse_full(program), ".", _jq_make_ctx(opts), [])), dict())
   | {c: _jq_c(ast), ast: ast}
 end
 
