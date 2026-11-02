@@ -3920,6 +3920,89 @@ def _jq_re_compile_node(node, names):
 end
 
 # Compiles a pattern with a flag string into a program.
+# ----- native engine -----
+# Patterns that mq's own regex engine runs the same way jq does are translated from the parsed
+# pattern and run natively, which is far faster on long input. Anything else (lookaround,
+# backreferences, atomic groups, possessive quantifiers, POSIX classes, \Z, patterns that can
+# match the empty string) stays with the engine below.
+
+def _jq_re_hexcp(c):
+  if (c < 16): "0123456789abcdef"[c]
+  else: _jq_re_hexcp(floor(c / 16)) + "0123456789abcdef"[c % 16]
+end
+
+def _jq_re_native_cp(c):
+  "\\x{" + _jq_re_hexcp(c) + "}"
+end
+
+def _jq_re_native_set(node):
+  let ranges = node["ranges"]
+  | let preds = node["preds"]
+  | let ascii_ci = !node["ci"] || fold(ranges, true, fn(a, r): a && r[1] < 128;)
+  | let simple = fold(preds, true, fn(a, p):
+      a && is_none(p["sub"]) && (p["name"] == "d" || p["name"] == "w" || p["name"] == "s");)
+  | if (!ascii_ci || !simple || (is_empty(ranges) && is_empty(preds))): None
+    else: do
+      let body = fold(ranges, "", fn(a, r):
+          a + (if (r[0] == r[1]): _jq_re_native_cp(r[0]) else: _jq_re_native_cp(r[0]) + "-" + _jq_re_native_cp(r[1]));)
+        + fold(preds, "", fn(a, p): a + "\\" + (if (p["neg"]): upcase(p["name"]) else: p["name"]);)
+      | let set = "[" + (if (node["neg"]): "^" else: "") + body + "]"
+      | [if (node["ci"]): "(?i:" + set + ")" else: set, 1]
+    end
+end
+
+# Returns [native source, shortest match length] or None when the node cannot be translated.
+def _jq_re_native(node):
+  let t = node["t"]
+  | if (t == "empty"): ["", 0]
+    elif (t == "char"): do
+      let c = node["c"]
+      | if (node["ci"] && c > 127): None
+        else: do
+          let lit = _jq_re_native_cp(c)
+          | [if (node["ci"]): "(?i:" + lit + ")" else: lit, 1]
+        end
+    end
+    elif (t == "any"): [if (node["dotall"]): "(?s:.)" else: ".", 1]
+    elif (t == "set"): _jq_re_native_set(node)
+    elif (t == "seq"): fold(node["items"], ["", 0], fn(acc, item):
+        if (is_none(acc)): None
+        else: do
+          let r = _jq_re_native(item)
+          | if (is_none(r)): None else: [acc[0] + r[0], acc[1] + r[1]]
+        end
+      ;)
+    elif (t == "alt"): do
+      let parts = map(node["alts"], _jq_re_native)
+      | if (fold(parts, false, fn(a, r): a || is_none(r);)): None
+        else: ["(?:" + join(map(parts, fn(r): r[0];), "|") + ")", fold(parts, 1000000000, fn(a, r): if (r[1] < a): r[1] else: a;)]
+    end
+    elif (t == "ncgroup"): do
+      let r = _jq_re_native(node["node"])
+      | if (is_none(r)): None else: ["(?:" + r[0] + ")", r[1]]
+    end
+    elif (t == "group"): do
+      let r = _jq_re_native(node["node"])
+      | if (is_none(r)): None
+        else: ["(" + r[0] + ")", r[1]]
+    end
+    elif (t == "rep"): do
+      let r = _jq_re_native(node["node"])
+      | if (is_none(r) || r[1] == 0 || node["poss"] || node["max"] < node["min"]): None
+        else: do
+          let mx = node["max"]
+          | let q = "{" + to_string(node["min"]) + (if (mx >= 1000000000): ",}" else: "," + to_string(mx) + "}")
+          | ["(?:" + r[0] + ")" + q + (if (node["lazy"]): "?" else: ""), r[1] * node["min"]]
+        end
+    end
+    elif (t == "bos" || (t == "bol" && !node["m"])): ["\\A", 0]
+    elif (t == "eos" || (t == "eol" && !node["m"])): ["\\z", 0]
+    elif (t == "bol"): ["(?m:^)", 0]
+    elif (t == "eol"): ["(?m:$)", 0]
+    elif (t == "wordb"): [if (node["neg"]): "\\B" else: "\\b", 0]
+    else: None
+end
+
 def _jq_re_compile(re, flags):
   let fl = if (is_none(flags)): "" else: flags
   | if (!is_string(fl)): error(_jq_dump(fl) + " is not a string")
@@ -3942,13 +4025,44 @@ def _jq_re_compile(re, flags):
       | let st0 = {ng: 0, names: [], i: st_i, x: st_x, m: false, s: st_s}
       | let r = _jq_re_p_alt(cps, 0, st0)
       | if (r[1] < len(cps)): error(re + " (at offset " + to_string(r[1]) + ") is not a valid regex: unmatched close parenthesis")
-        else: {m: _jq_re_compile_node(r[0], r[2]["names"]), ng: r[2]["ng"], names: r[2]["names"], global: global, noempty: noempty}
+        else: {m: _jq_re_compile_node(r[0], r[2]["names"]), node: r[0], ng: r[2]["ng"], names: r[2]["names"], global: global, noempty: noempty}
     end
+end
+
+# Strings at least this long are matched natively when the pattern allows it; shorter ones
+# are not worth translating the pattern for.
+def _jq_re_native_min_input(): 32;
+
+# Native counterpart of _jq_re_run_own, producing the same jq match objects.
+def _jq_re_run_native(prog, src, str, test_only):
+  if (test_only): if (is_regex_match(str, src)): [true] else: []
+  else: do
+    let found = regex_match_info(str, src)
+    | let chosen = if (prog["global"]): found else: slice(found, 0, 1)
+    | map(chosen, fn(m):
+        do
+          if (len(m["groups"]) != prog["ng"]): error("native engine disagrees on the group count")
+          | {offset: m["char_start"], length: m["char_end"] - m["char_start"], string: m["match"],
+              captures: map(if (prog["ng"] == 0): [] else: range(0, prog["ng"] - 1), fn(g):
+                do
+                  let c = m["groups"][g]
+                  | if (is_none(c["match"])): {offset: -1, length: 0, string: None, name: prog["names"][g]}
+                    else: {offset: c["char_start"], length: c["char_end"] - c["char_start"], string: c["match"], name: prog["names"][g]}
+                end;)}
+        end;)
+  end
+end
+
+def _jq_re_run(prog, str, test_only):
+  let nat = if (len(str) >= _jq_re_native_min_input()): _jq_re_native(prog["node"]) else: None
+  | if (is_none(nat) || nat[1] == 0): _jq_re_run_own(prog, str, test_only)
+    else: try: _jq_re_run_native(prog, nat[0], str, test_only)
+      catch(e): _jq_re_run_own(prog, str, test_only)
 end
 
 # Finds all matches (or just the first, unless global) of a program in a string.
 # Returns jq match objects.
-def _jq_re_run(prog, str, test_only):
+def _jq_re_run_own(prog, str, test_only):
   let s = explode(str)
   | let n = len(s)
   | let ng = prog["ng"]

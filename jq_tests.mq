@@ -498,6 +498,24 @@ def test_number_formatting_large_and_small_magnitudes():
   | assert_jq("1e-7 + 0 | tojson | fromjson", None, 1e-7)
 end
 
+# Inputs of 32 characters or more are matched by mq's native regex engine when the pattern
+# allows it, and by the engine in jq.mq otherwise (lookahead below). Expected values come from jq.
+def test_regex_long_input():
+  let text = "日本語 日本語 日本語 日本語 foo123 bar45 BAZ6 ١٢٣ qux"
+  | assert_jq("[match(\"(?<w>[a-z]+)(?<d>[0-9]+)(x)?\"; \"g\")] | map([.offset, .length, .string, (.captures | map([.offset, .length, .string, .name]))])", text, [[16, 6, "foo123", [[16, 3, "foo", "w"], [19, 3, "123", "d"], [-1, 0, None, None]]], [23, 5, "bar45", [[23, 3, "bar", "w"], [26, 2, "45", "d"], [-1, 0, None, None]]]])
+  | assert_jq("[match(\"[a-z]+(?=[0-9])\"; \"g\") | [.offset, .string]]", text, [[16, "foo"], [23, "bar"]])
+  | assert_jq("[match(\"\\\\d+\"; \"g\") | [.offset, .string]]", text, [[19, "123"], [26, "45"], [32, "6"], [34, "١٢٣"]])
+  | assert_jq("[match(\"baz\"; \"gi\") | [.offset, .string]]", text, [[29, "BAZ"]])
+  | assert_jq("gsub(\"[0-9]+\"; \"#\")", text, "日本語 日本語 日本語 日本語 foo# bar# BAZ# ١٢٣ qux")
+  | assert_jq("[scan(\"(\\\\w)(\\\\d)\")]", text, [["o", "1"], ["2", "3"], ["r", "4"], ["Z", "6"], ["١", "٢"]])
+  | assert_jq("[match(\"\\\\bba\\\\w+\"; \"g\") | [.offset, .string]]", text, [[23, "bar45"]])
+  | assert_jq("test(\"qux$\")", text, true)
+  | assert_jq("test(\"quux$\")", text, false)
+  | assert_jq("capture(\"(?<w>[a-z]+)(?<d>[0-9]+)\")", text, {"w": "foo", "d": "123"})
+  | assert_jq("[match(\"日本語|foo\"; \"g\") | .offset]", text, [0, 4, 8, 12, 16])
+  | assert_jq("[splits(\"\\\\s+\")] | length", text, 9)
+end
+
 def test_division_by_tiny_divisors():
   assert_jq("[1 / 1e-17, -1 / 1e-17, 7 / 3e-300, 1 / 3e-16] | tojson", None, "[1e+17,-1e+17,2.3333333333333332e+300,3333333333333333.5]")
   | assert_jq("[1e300 / 1e-300, 1 / 5e-324] | tojson", None, "[1.7976931348623157e+308,1.7976931348623157e+308]")
